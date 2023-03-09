@@ -108,8 +108,8 @@ impl FullyQualifiedImageName {
         } = parsed_qualifier;
 
         let (hostname, port) = match registry {
-            None => (String::from("docker.io"), 80),
-            Some(ParsedDomain { hostname, port }) => (hostname, port.unwrap_or(80)),
+            None => (String::from("docker.io"), 443),
+            Some(ParsedDomain { hostname, port }) => (hostname, port.unwrap_or(443)),
         };
 
         Self {
@@ -271,10 +271,10 @@ mod tests {
         let test_vectors = [
             (
                 "ubuntu",
-                "docker.io:80/ubuntu:latest",
+                "docker.io:443/ubuntu:latest",
                 FullyQualifiedImageName {
                     hostname: "docker.io".into(),
-                    port: 80,
+                    port: 443,
                     repository: "ubuntu".into(),
                     tag: Tag {
                         tag: "latest".into(),
@@ -285,10 +285,10 @@ mod tests {
 
             (
                 "registry.example.com/ubuntu",
-                "registry.example.com:80/ubuntu:latest",
+                "registry.example.com:443/ubuntu:latest",
                 FullyQualifiedImageName {
                     hostname: "registry.example.com".into(),
-                    port: 80,
+                    port: 443,
                     repository: "ubuntu".into(),
                     tag: Tag {
                         tag: "latest".into(),
@@ -341,10 +341,10 @@ mod tests {
 
             (
                 "example.com/image:some_tag",
-                "example.com:80/image:some_tag",
+                "example.com:443/image:some_tag",
                 FullyQualifiedImageName {
                     hostname: "example.com".into(),
-                    port: 80,
+                    port: 443,
                     repository: "image".into(),
                     tag: Tag {
                         tag: "some_tag".into(),
