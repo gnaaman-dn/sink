@@ -2,11 +2,15 @@ use std::{
     fmt::{Display, Write},
     str::FromStr,
 };
+use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ImageQualifierParseError {
+    #[error("FLORP")]
     MissingRepositoryName,
+    #[error("FLORP")]
     InvalidCharacterInDomain,
+    #[error("FLORP")]
     InvalidPort,
 }
 
@@ -93,10 +97,10 @@ impl Display for ParsedImageReference {
 /// As opposed to [`ParsedImageReference`], no component is ommited.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FullyQualifiedImageName {
-    hostname: String,
-    port: u16,
-    repository: String,
-    tag: Tag,
+    pub hostname: String,
+    pub port: u16,
+    pub repository: String,
+    pub tag: Tag,
 }
 
 impl FullyQualifiedImageName {

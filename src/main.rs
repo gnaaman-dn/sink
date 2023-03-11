@@ -1,10 +1,18 @@
 use rayon::prelude::*;
-use std::{collections::HashMap, fs::File, str::FromStr};
+use reqwest::{StatusCode, Method};
+use serde::Deserialize;
+use tokio::io::AsyncReadExt;
+use std::{collections::HashMap, fs::File, str::FromStr, io::Write};
 use tar::Archive;
 
 pub mod oci;
 use oci::*;
 pub mod docker_registry_v2;
+pub mod response_async_reader;
+
+use response_async_reader::ResponseAsyncReader;
+
+const IMAGE_MANIFEST_CONTENT_TYPES: &str = "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json";
 
 fn bytes_to_human_size(byte_size: u64) -> (f64, &'static str) {
     if byte_size > 1024 * 1024 * 1024 {
@@ -119,14 +127,130 @@ fn analyze(tar_path: &str) {
 
     // dbg!(layer_data);
 }
+// # Get Docker token (this function is useless for unauthenticated registries like Microsoft)
+// def get_auth_head(type):
+// 	resp = requests.get('{}?service={}&scope=repository:{}:pull'.format(auth_url, reg_service, repository), verify=False)
+// 	access_token = resp.json()['token']
+// 	auth_head = {'Authorization':'Bearer '+ access_token, 'Accept': type}
+// 	return auth_head
+fn parse_authentication_header(source: &str) -> HashMap<&str, &str> {
+    let mut map = HashMap::new();
+    for component in source.split(',') {
+        if let Some((key, value)) = component.split_once('=') {
+            map.insert(key, value.trim_matches('"'));
+        } else {
+            eprintln!("Malformed component '{component}'");
+        }
+    }
+    map
+}
+/*
+response = {
+    "access_token": String("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsIng1YyI6WyJNSUlDK1RDQ0FwK2dBd0lCQWdJQkFEQUtCZ2dxaGtqT1BRUURBakJHTVVRd1FnWURWUVFERXp0U1RVbEdPbEZNUmpRNlEwZFFNenBSTWtWYU9sRklSRUk2VkVkRlZUcFZTRlZNT2taTVZqUTZSMGRXV2pwQk5WUkhPbFJMTkZNNlVVeElTVEFlRncweU16QXhNRFl3TkRJM05EUmFGdzB5TkRBeE1qWXdOREkzTkRSYU1FWXhSREJDQmdOVkJBTVRPME5EVlVZNlNqVkhOanBGUTFORU9rTldSRWM2VkRkTU1qcEtXa1pST2xOTk0wUTZXRmxQTkRwV04wTkhPa2RHVjBJNldsbzFOam8wVlVSRE1JSUJJakFOQmdrcWhraUc5dzBCQVFFRkFBT0NBUThBTUlJQkNnS0NBUUVBek4wYjBqN1V5L2FzallYV2gyZzNxbzZKaE9rQWpYV0FVQmNzSHU2aFlaUkZMOXZlODEzVEI0Y2w4UWt4Q0k0Y1VnR0duR1dYVnhIMnU1dkV0eFNPcVdCcnhTTnJoU01qL1ZPKzYvaVkrOG1GRmEwR2J5czF3VDVjNlY5cWROaERiVGNwQXVYSjFSNGJLdSt1VGpVS0VIYXlqSFI5TFBEeUdnUC9ubUFadk5PWEdtclNTSkZJNnhFNmY3QS8rOVptcWgyVlRaQlc0cXduSnF0cnNJM2NveDNQczMwS2MrYUh3V3VZdk5RdFNBdytqVXhDVVFoRWZGa0lKSzh6OVdsL1FjdE9EcEdUeXNtVHBjNzZaVEdKWWtnaGhGTFJEMmJQTlFEOEU1ZWdKa2RQOXhpaW5sVGx3MjBxWlhVRmlqdWFBcndOR0xJbUJEWE0wWlI1YzVtU3Z3SURBUUFCbzRHeU1JR3ZNQTRHQTFVZER3RUIvd1FFQXdJSGdEQVBCZ05WSFNVRUNEQUdCZ1JWSFNVQU1FUUdBMVVkRGdROUJEdERRMVZHT2tvMVJ6WTZSVU5UUkRwRFZrUkhPbFEzVERJNlNscEdVVHBUVFRORU9saFpUelE2VmpkRFJ6cEhSbGRDT2xwYU5UWTZORlZFUXpCR0JnTlZIU01FUHpBOWdEdFNUVWxHT2xGTVJqUTZRMGRRTXpwUk1rVmFPbEZJUkVJNlZFZEZWVHBWU0ZWTU9rWk1WalE2UjBkV1dqcEJOVlJIT2xSTE5GTTZVVXhJU1RBS0JnZ3Foa2pPUFFRREFnTklBREJGQWlFQW1RNHhsQXZXVlArTy9hNlhDU05pYUFYRU1Bb1RQVFRYRWJYMks2RVU4ZTBDSUg0QTAwSVhtUndjdGtEOHlYNzdkTVoyK0pEY1FGdDFxRktMZFR5SnVzT1UiXX0.eyJhY2Nlc3MiOltdLCJhdWQiOiJyZWdpc3RyeS5kb2NrZXIuaW8iLCJleHAiOjE2Nzg0Mjg1ODYsImlhdCI6MTY3ODQyODI4NiwiaXNzIjoiYXV0aC5kb2NrZXIuaW8iLCJqdGkiOiJkY2tyX2p0aV9GR0tzalg3aXk3MFNSOEl2ZEltaG42aXY2V2c9IiwibmJmIjoxNjc4NDI3OTg2LCJzdWIiOiIifQ.OH_S-PKZoPSY0PG-9SXBCHaK59oIACEkZZ_yK_hRGRSIn0FfQyLFxDCakvkBD8rlGVKO-Sb3JA0cFRSyqbwj_UscZklOAEpGZ5bXaQu1xuR6tgAeAb1yQS91HHEVTVwhjTuyfNoDUrULfZY_M7dWbuIVB4QV_XVYNzXlaHV2DHG9DiUPnF4gQXI7l_gV0o06ajvZmDXRKtbZLBYMQgG-3qOU7_eaU9S0IQ63v79nTEKvEoAcC8XNHEGHRNI6HNuLXKJtb3eM5PmL3MsGYFmoradDJN7scAqo6rzznuzBxYce642N96Dw7rccCJppsWtL3MIjitO1oRrKErCB2AOdNQ"),
+    "issued_at": String("2023-03-10T06:04:46.228904662Z"),
+    "token": String("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsIng1YyI6WyJNSUlDK1RDQ0FwK2dBd0lCQWdJQkFEQUtCZ2dxaGtqT1BRUURBakJHTVVRd1FnWURWUVFERXp0U1RVbEdPbEZNUmpRNlEwZFFNenBSTWtWYU9sRklSRUk2VkVkRlZUcFZTRlZNT2taTVZqUTZSMGRXV2pwQk5WUkhPbFJMTkZNNlVVeElTVEFlRncweU16QXhNRFl3TkRJM05EUmFGdzB5TkRBeE1qWXdOREkzTkRSYU1FWXhSREJDQmdOVkJBTVRPME5EVlVZNlNqVkhOanBGUTFORU9rTldSRWM2VkRkTU1qcEtXa1pST2xOTk0wUTZXRmxQTkRwV04wTkhPa2RHVjBJNldsbzFOam8wVlVSRE1JSUJJakFOQmdrcWhraUc5dzBCQVFFRkFBT0NBUThBTUlJQkNnS0NBUUVBek4wYjBqN1V5L2FzallYV2gyZzNxbzZKaE9rQWpYV0FVQmNzSHU2aFlaUkZMOXZlODEzVEI0Y2w4UWt4Q0k0Y1VnR0duR1dYVnhIMnU1dkV0eFNPcVdCcnhTTnJoU01qL1ZPKzYvaVkrOG1GRmEwR2J5czF3VDVjNlY5cWROaERiVGNwQXVYSjFSNGJLdSt1VGpVS0VIYXlqSFI5TFBEeUdnUC9ubUFadk5PWEdtclNTSkZJNnhFNmY3QS8rOVptcWgyVlRaQlc0cXduSnF0cnNJM2NveDNQczMwS2MrYUh3V3VZdk5RdFNBdytqVXhDVVFoRWZGa0lKSzh6OVdsL1FjdE9EcEdUeXNtVHBjNzZaVEdKWWtnaGhGTFJEMmJQTlFEOEU1ZWdKa2RQOXhpaW5sVGx3MjBxWlhVRmlqdWFBcndOR0xJbUJEWE0wWlI1YzVtU3Z3SURBUUFCbzRHeU1JR3ZNQTRHQTFVZER3RUIvd1FFQXdJSGdEQVBCZ05WSFNVRUNEQUdCZ1JWSFNVQU1FUUdBMVVkRGdROUJEdERRMVZHT2tvMVJ6WTZSVU5UUkRwRFZrUkhPbFEzVERJNlNscEdVVHBUVFRORU9saFpUelE2VmpkRFJ6cEhSbGRDT2xwYU5UWTZORlZFUXpCR0JnTlZIU01FUHpBOWdEdFNUVWxHT2xGTVJqUTZRMGRRTXpwUk1rVmFPbEZJUkVJNlZFZEZWVHBWU0ZWTU9rWk1WalE2UjBkV1dqcEJOVlJIT2xSTE5GTTZVVXhJU1RBS0JnZ3Foa2pPUFFRREFnTklBREJGQWlFQW1RNHhsQXZXVlArTy9hNlhDU05pYUFYRU1Bb1RQVFRYRWJYMks2RVU4ZTBDSUg0QTAwSVhtUndjdGtEOHlYNzdkTVoyK0pEY1FGdDFxRktMZFR5SnVzT1UiXX0.eyJhY2Nlc3MiOltdLCJhdWQiOiJyZWdpc3RyeS5kb2NrZXIuaW8iLCJleHAiOjE2Nzg0Mjg1ODYsImlhdCI6MTY3ODQyODI4NiwiaXNzIjoiYXV0aC5kb2NrZXIuaW8iLCJqdGkiOiJkY2tyX2p0aV9GR0tzalg3aXk3MFNSOEl2ZEltaG42aXY2V2c9IiwibmJmIjoxNjc4NDI3OTg2LCJzdWIiOiIifQ.OH_S-PKZoPSY0PG-9SXBCHaK59oIACEkZZ_yK_hRGRSIn0FfQyLFxDCakvkBD8rlGVKO-Sb3JA0cFRSyqbwj_UscZklOAEpGZ5bXaQu1xuR6tgAeAb1yQS91HHEVTVwhjTuyfNoDUrULfZY_M7dWbuIVB4QV_XVYNzXlaHV2DHG9DiUPnF4gQXI7l_gV0o06ajvZmDXRKtbZLBYMQgG-3qOU7_eaU9S0IQ63v79nTEKvEoAcC8XNHEGHRNI6HNuLXKJtb3eM5PmL3MsGYFmoradDJN7scAqo6rzznuzBxYce642N96Dw7rccCJppsWtL3MIjitO1oRrKErCB2AOdNQ"),
+    "expires_in": Number(300),
+}
+ */
 
-fn download(image_reference: &str) {
-    let image_reference = docker_registry_v2::FullyQualifiedImageName::from_str(image_reference);
-    dbg!(image_reference);
+#[derive(Debug, Clone, Deserialize)]
+struct AuthToken {
+    access_token: Option<String>,
+    issued_at: Option<String>,
+    token: String,
+    expires_in: Option<usize>,
 }
 
-fn main() {
-    let image_tar_name = std::env::args().nth(1).unwrap();
+/// https://docs.docker.com/registry/spec/auth/token/#how-to-authenticate
+async fn get_auth_token(registry: &str, repository_namespace: &str, repository: &str) -> anyhow::Result<Option<AuthToken>> {
+    // let registry = "registry-1.docker.io";
+    let url = format!("https://{registry}/v2/");
+    let response = reqwest::get(url).await?;
+    if response.status() == StatusCode::UNAUTHORIZED {
+        let auth = response.headers().get("WWW-Authenticate").unwrap();
+        let auth = parse_authentication_header(auth.to_str()?);
+        let auth_url = auth["Bearer realm"];
+        let reg_service = auth["service"];
+        let url = format!("{auth_url}?service={reg_service}&scope=repository:{repository_namespace}{repository}:pull");
+        dbg!(&url);
+        let response = reqwest::get(url).await?.text().await?;
+        let parsed_response = serde_json::from_str::<AuthToken>(&response);
+        if let Err(_e) = &parsed_response {
+            println!("{response}");
+        };
+        Ok(Some(parsed_response?))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn download(image_reference: &str) -> anyhow::Result<oci_spec::image::ImageManifest> {
+    let image_reference = docker_registry_v2::ParsedImageReference::from_str(image_reference)?;
+    dbg!(&image_reference);
+
+    let (registry, repository_namespace) = if let Some(registry) = image_reference.registry {
+        (registry.to_string(), "")
+    } else {
+        ("registry-1.docker.io".to_string(), "library/")
+    };
+
+    let tag = image_reference.tag.map_or_else(|| "latest".to_string(), |t| t.to_string());
+    let url = format!("https://{registry}/v2/{repository_namespace}{}/manifests/{tag}", image_reference.repository);
+
+    dbg!(&url);
+
+    let token = dbg!(get_auth_token(&registry, repository_namespace, &image_reference.repository).await?);
+
+    let client = reqwest::Client::builder().gzip(true).build()?;
+    let mut request = client.request(Method::GET, url).header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
+    if let Some(token) = &token {
+        request = request.bearer_auth(&token.token);
+    }
+    let request = request.build()?;
+    let response = dbg!(client.execute(request).await?);
+    let text = response.text().await?;
+    let manifest  = serde_json::from_str::<oci_spec::image::ImageManifest>(&text)?;
+
+    for layer in manifest.layers() {
+        // dbg!(layer);
+        let digest = layer.digest();
+        
+        let url = dbg!(format!("https://{registry}/v2/{repository_namespace}{}/blobs/{digest}", image_reference.repository));
+        let mut request = client.request(Method::GET, url).header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
+        if let Some(token) = &token {
+            request = request.bearer_auth(&token.token);
+        }
+        let request = request.build()?;
+        let response = client.execute(request).await?;
+        
+        let reader = ResponseAsyncReader::new(response);
+        let mut decomp = async_compression::tokio::bufread::GzipDecoder::new(reader);
+        let mut buf = [0u8; 4096];
+        let mut file = File::create(digest)?;
+        loop {
+            let size = decomp.read(&mut buf).await?;
+            if size == 0 {
+                break;
+            }
+            let buf = &buf[..size];
+            file.write(buf)?;
+        }
+    }
+    Ok(manifest)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()>{
     // analyze(&image_tar_name);
-    download(&image_tar_name);
+    let futures: Vec<_> = std::env::args().skip(1).map(|img| tokio::spawn(async move { download(&img).await })).collect();
+    // download(&image_tar_name).await
+    let mut layers = Vec::new();
+    for f in futures {
+        let m = f.await??;
+        layers.extend(m.layers().iter().map(|l| l.digest().clone()));
+    }
+    // for img in std::env::args().skip(1) {
+    //     download(img).await?;
+    // }
+    Ok(())
 }
