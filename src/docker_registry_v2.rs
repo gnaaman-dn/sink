@@ -51,7 +51,6 @@ impl Display for Tag {
 /// An image reference in a registry, parsed according to the grammer specified [here][1].
 ///
 /// Not all fields are mandatory.
-/// To fill in the missing fields with defaults, see [`FullyQualifiedImageName`].
 ///
 /// Parsing is permissive and might not return an error for slightly invalid input.
 /// This behaviour might change in the future to conform with grammer and reject more invalid inputs.
@@ -92,54 +91,6 @@ impl Display for ParsedImageReference {
     }
 }
 
-/// A fully-qualified image name.
-///
-/// As opposed to [`ParsedImageReference`], no component is ommited.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FullyQualifiedImageName {
-    pub hostname: String,
-    pub port: u16,
-    pub repository: String,
-    pub tag: Tag,
-}
-
-impl FullyQualifiedImageName {
-    fn new(parsed_qualifier: ParsedImageReference) -> Self {
-        let ParsedImageReference {
-            registry,
-            repository,
-            tag,
-        } = parsed_qualifier;
-
-        let (hostname, port) = match registry {
-            None => (String::from("docker.io"), 443),
-            Some(ParsedDomain { hostname, port }) => (hostname, port.unwrap_or(443)),
-        };
-
-        Self {
-            hostname,
-            port,
-            repository,
-            tag: tag.unwrap_or_else(|| Tag {
-                tag: "latest".into(),
-                digest: None,
-            }),
-        }
-    }
-}
-
-impl Display for FullyQualifiedImageName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.hostname)?;
-        f.write_char(':')?;
-        self.port.fmt(f)?;
-        f.write_char('/')?;
-        f.write_str(&self.repository)?;
-        f.write_char(':')?;
-        self.tag.fmt(f)?;
-        Ok(())
-    }
-}
 
 fn split_zero_or_once(haystack: &str, needle: char) -> (&str, Option<&str>) {
     match haystack.split_once(needle) {
@@ -200,13 +151,6 @@ impl FromStr for ParsedImageReference {
     }
 }
 
-impl FromStr for FullyQualifiedImageName {
-    type Err = ImageQualifierParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(s.parse()?))
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -266,125 +210,6 @@ mod tests {
 
         for (src, parsed) in test_vectors.into_iter() {
             assert_eq!(parsed.to_string(), src);
-            assert_eq!(src.parse(), Ok(parsed));
-        }
-    }
-
-    #[test]
-    fn test_parsed_full_qualified() {
-        let test_vectors = [
-            (
-                "ubuntu",
-                "docker.io:443/ubuntu:latest",
-                FullyQualifiedImageName {
-                    hostname: "docker.io".into(),
-                    port: 443,
-                    repository: "ubuntu".into(),
-                    tag: Tag {
-                        tag: "latest".into(),
-                        digest: None
-                    },
-                }
-            ),
-
-            (
-                "registry.example.com/ubuntu",
-                "registry.example.com:443/ubuntu:latest",
-                FullyQualifiedImageName {
-                    hostname: "registry.example.com".into(),
-                    port: 443,
-                    repository: "ubuntu".into(),
-                    tag: Tag {
-                        tag: "latest".into(),
-                        digest: None
-                    },
-                }
-            ),
-
-            (
-                "registry.example.com:8000/ubuntu",
-                "registry.example.com:8000/ubuntu:latest",
-                FullyQualifiedImageName {
-                    hostname: "registry.example.com".into(),
-                    port: 8000,
-                    repository: "ubuntu".into(),
-                    tag: Tag {
-                        tag: "latest".into(),
-                        digest: None
-                    },
-                }
-            ),
-
-            (
-                "registry.example.com:8000/image/name",
-                "registry.example.com:8000/image/name:latest",
-                FullyQualifiedImageName {
-                    hostname: "registry.example.com".into(),
-                    port: 8000,
-                    repository: "image/name".into(),
-                    tag: Tag {
-                        tag: "latest".into(),
-                        digest: None
-                    },
-                }
-            ),
-
-            (
-                "staging-registry.example.com:8000/image/name",
-                "staging-registry.example.com:8000/image/name:latest",
-                FullyQualifiedImageName {
-                    hostname: "staging-registry.example.com".into(),
-                    port: 8000,
-                    repository: "image/name".into(),
-                    tag: Tag {
-                        tag: "latest".into(),
-                        digest: None
-                    },
-                }
-            ),
-
-            (
-                "example.com/image:some_tag",
-                "example.com:443/image:some_tag",
-                FullyQualifiedImageName {
-                    hostname: "example.com".into(),
-                    port: 443,
-                    repository: "image".into(),
-                    tag: Tag {
-                        tag: "some_tag".into(),
-                        digest: None
-                    },
-                }
-            ),
-
-            (
-                "example.com:8000/image:some_tag",
-                "example.com:8000/image:some_tag",
-                FullyQualifiedImageName {
-                    hostname: "example.com".into(),
-                    port: 8000,
-                    repository: "image".into(),
-                    tag: Tag {
-                        tag: "some_tag".into(),
-                        digest: None
-                    },
-                }
-            ),
-
-            (
-                "example.com:8000/image:some_tag@55c442300ad577bd85d7158e6e29c8c9bb55a91fe4873693587cd078d39fd2c1", 
-                "example.com:8000/image:some_tag@55c442300ad577bd85d7158e6e29c8c9bb55a91fe4873693587cd078d39fd2c1", 
-                FullyQualifiedImageName {
-                    hostname: "example.com".into(),
-                    port: 8000,
-                    repository: "image".into(),
-                    tag: Tag { tag: "some_tag".into(), digest: Some("55c442300ad577bd85d7158e6e29c8c9bb55a91fe4873693587cd078d39fd2c1".into()) },
-                }
-            )
-        ];
-
-        for (src, redisplayed, parsed) in test_vectors.into_iter() {
-            assert_eq!(parsed.to_string(), redisplayed);
             assert_eq!(src.parse(), Ok(parsed));
         }
     }

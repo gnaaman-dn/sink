@@ -4,6 +4,7 @@ use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use std::{collections::HashMap, fs::File, str::FromStr, io::Write};
 use tar::Archive;
+use clap::{Parser, Subcommand};
 
 pub mod oci;
 use oci::*;
@@ -201,7 +202,7 @@ async fn download(image_reference: &str) -> anyhow::Result<oci_spec::image::Imag
 
     let token = dbg!(get_auth_token(&registry, repository_namespace, &image_reference.repository).await?);
 
-    let client = reqwest::Client::builder().gzip(true).build()?;
+    let client = reqwest::Client::new();
     let mut request = client.request(Method::GET, url).header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
     if let Some(token) = &token {
         request = request.bearer_auth(&token.token);
@@ -239,18 +240,38 @@ async fn download(image_reference: &str) -> anyhow::Result<oci_spec::image::Imag
     Ok(manifest)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()>{
-    // analyze(&image_tar_name);
-    let futures: Vec<_> = std::env::args().skip(1).map(|img| tokio::spawn(async move { download(&img).await })).collect();
-    // download(&image_tar_name).await
-    let mut layers = Vec::new();
-    for f in futures {
-        let m = f.await??;
-        layers.extend(m.layers().iter().map(|l| l.digest().clone()));
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: SubCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum SubCommand {
+    Download {
+        images: Vec<String>
     }
-    // for img in std::env::args().skip(1) {
-    //     download(img).await?;
-    // }
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = dbg!(Args::parse());
+    
+    // analyze(&image_tar_name);
+    match args.command {
+        SubCommand::Download { images } => {
+            let futures: Vec<_> = images.into_iter().map(|img| tokio::spawn(async move {
+                download(&img).await
+            })).collect();
+
+            let mut layers = Vec::new();
+            for f in futures {
+                let m = f.await??;
+                layers.extend(m.layers().iter().map(|l| l.digest().clone()));
+            }
+        }
+    }
+    
     Ok(())
 }
