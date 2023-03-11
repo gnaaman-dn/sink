@@ -1,16 +1,22 @@
-use rayon::prelude::*;
-use reqwest::{StatusCode, Method};
-use serde::Deserialize;
-use tokio::io::AsyncReadExt;
-use std::{collections::HashMap, fs::File, str::FromStr, io::Write};
-use tar::Archive;
 use clap::{Parser, Subcommand};
+use rayon::prelude::*;
+use reqwest::{Method, StatusCode, Client};
+use serde::Deserialize;
+use std::{
+    collections::{HashMap, HashSet},
+    fs::File,
+    io::Write,
+    str::FromStr,
+};
+use tar::Archive;
+use tokio::io::AsyncReadExt;
 
 pub mod oci;
 use oci::*;
 pub mod docker_registry_v2;
 pub mod response_async_reader;
 
+use docker_registry_v2::{ParsedImageReference, ParsedDomain};
 use response_async_reader::ResponseAsyncReader;
 
 const IMAGE_MANIFEST_CONTENT_TYPES: &str = "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json";
@@ -162,19 +168,42 @@ struct AuthToken {
     expires_in: Option<usize>,
 }
 
+/// Probe the target registry for authentication.
+/// If necessary, request for an OAuth token for pulling from the specified repositories.
+///
 /// https://docs.docker.com/registry/spec/auth/token/#how-to-authenticate
-async fn get_auth_token(registry: &str, repository_namespace: &str, repository: &str) -> anyhow::Result<Option<AuthToken>> {
-    // let registry = "registry-1.docker.io";
+async fn get_auth_token(
+    client: reqwest::Client,
+    registry: &str,
+    repository_namespace: &str,
+    repositories: impl Iterator<Item=&str>,
+) -> anyhow::Result<Option<AuthToken>> {
     let url = format!("https://{registry}/v2/");
-    let response = reqwest::get(url).await?;
+
+    let response = client.get(url).send().await?;
+
     if response.status() == StatusCode::UNAUTHORIZED {
         let auth = response.headers().get("WWW-Authenticate").unwrap();
         let auth = parse_authentication_header(auth.to_str()?);
         let auth_url = auth["Bearer realm"];
         let reg_service = auth["service"];
-        let url = format!("{auth_url}?service={reg_service}&scope=repository:{repository_namespace}{repository}:pull");
-        dbg!(&url);
-        let response = reqwest::get(url).await?.text().await?;
+
+        let scopes = repositories
+            .map(|repository| format!("repository:{repository_namespace}{repository}:pull"))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let response = client
+            .get(auth_url)
+            .query(&[
+                ("service", reg_service),
+                ("scope", scopes.as_str()),
+            ])
+            .send()
+            .await?
+            .text()
+            .await?;
+
         let parsed_response = serde_json::from_str::<AuthToken>(&response);
         if let Err(_e) = &parsed_response {
             println!("{response}");
@@ -185,45 +214,138 @@ async fn get_auth_token(registry: &str, repository_namespace: &str, repository: 
     }
 }
 
-async fn download(image_reference: &str) -> anyhow::Result<oci_spec::image::ImageManifest> {
-    let image_reference = docker_registry_v2::ParsedImageReference::from_str(image_reference)?;
-    dbg!(&image_reference);
+fn get_registry(parsed_domain: &Option<ParsedDomain>) -> (String, &'static str) {
+    if let Some(registry) = parsed_domain {
+        (registry.to_string(), "")
+    } else {
+        ("registry-1.docker.io".to_string(), "library/")
+    }
+}
 
+async fn get_manifest(client: Client, url: String, token: Option<&AuthToken>) -> anyhow::Result<oci_spec::image::ImageManifest> {
+    let mut request = client
+        .request(Method::GET, url)
+        .header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
+
+    if let Some(token) = token {
+        request = request.bearer_auth(&token.token);
+    };
+
+    let response = request.send().await;
+    let text = response?.text().await?;
+    let manifest = serde_json::from_str::<oci_spec::image::ImageManifest>(&text);
+
+    Ok(manifest?)
+}
+
+async fn download_a_bunch(images: &[ParsedImageReference]) -> anyhow::Result<()> {
+    let mut registries = HashMap::new();
+
+    for img_ref in images {
+        let (registry, repository_namespace) = get_registry(&img_ref.registry);
+        let f = registries
+            .entry((registry, repository_namespace))
+            .or_insert(Vec::new());
+        f.push((img_ref.repository.clone(), img_ref.tag.clone()));
+    }
+
+    let client = reqwest::Client::new();
+
+    // Get auth tokens for each repository.
+    let token_futures = registries.iter().map(|((registry, namespace), repositories)| {
+        let future = get_auth_token(client.clone(), registry, namespace, repositories.iter().map(|(repo, _tag)| repo.as_str()));
+        async { future.await.map(|token| (registry.clone(), token)) }
+    });
+    let tokens: HashMap<_, _> = futures::future::try_join_all(token_futures).await?.into_iter().collect();
+
+    // Get manifest for each image
+    let manifest_requests = images.iter().map(|img_ref| {
+        let (registry, repository_namespace) = get_registry(&img_ref.registry);
+
+        let tag = img_ref.tag.as_ref()
+            .map_or_else(|| "latest".to_string(), |t| t.to_string());
+
+        let url = format!(
+            "https://{registry}/v2/{repository_namespace}{}/manifests/{tag}",
+            img_ref.repository,
+        );
+
+        let token = tokens.get(&registry).map(|t| t.as_ref()).flatten();
+        get_manifest(client.clone(), url, token)
+    });
+    let manifests = futures::future::try_join_all(manifest_requests).await?;
+
+    let mut layer_digests = HashMap::new();
+    for (manifest, img_ref) in manifests.iter().zip(images.iter()) {
+        for layer in manifest.layers() {
+            layer_digests.insert(layer.digest().clone(), img_ref.repository.clone());
+        }
+    }
+
+    println!("Basically done");
+
+    Ok(())
+}
+
+async fn download(
+    image_reference: ParsedImageReference,
+) -> anyhow::Result<oci_spec::image::ImageManifest> {
     let (registry, repository_namespace) = if let Some(registry) = image_reference.registry {
         (registry.to_string(), "")
     } else {
         ("registry-1.docker.io".to_string(), "library/")
     };
 
-    let tag = image_reference.tag.map_or_else(|| "latest".to_string(), |t| t.to_string());
-    let url = format!("https://{registry}/v2/{repository_namespace}{}/manifests/{tag}", image_reference.repository);
+    let tag = image_reference
+        .tag
+        .map_or_else(|| "latest".to_string(), |t| t.to_string());
+    let url = format!(
+        "https://{registry}/v2/{repository_namespace}{}/manifests/{tag}",
+        image_reference.repository
+    );
 
     dbg!(&url);
 
-    let token = dbg!(get_auth_token(&registry, repository_namespace, &image_reference.repository).await?);
-
     let client = reqwest::Client::new();
-    let mut request = client.request(Method::GET, url).header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
+
+    let token = dbg!(
+        get_auth_token(
+            client.clone(),
+            &registry,
+            repository_namespace,
+            Some(image_reference.repository.as_str()).into_iter(),
+        )
+        .await?
+    );
+
+    let mut request = client
+        .request(Method::GET, url)
+        .header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
     if let Some(token) = &token {
         request = request.bearer_auth(&token.token);
     }
     let request = request.build()?;
     let response = dbg!(client.execute(request).await?);
     let text = response.text().await?;
-    let manifest  = serde_json::from_str::<oci_spec::image::ImageManifest>(&text)?;
+    let manifest = serde_json::from_str::<oci_spec::image::ImageManifest>(&text)?;
 
     for layer in manifest.layers() {
         // dbg!(layer);
         let digest = layer.digest();
-        
-        let url = dbg!(format!("https://{registry}/v2/{repository_namespace}{}/blobs/{digest}", image_reference.repository));
-        let mut request = client.request(Method::GET, url).header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
+
+        let url = dbg!(format!(
+            "https://{registry}/v2/{repository_namespace}{}/blobs/{digest}",
+            image_reference.repository
+        ));
+        let mut request = client
+            .request(Method::GET, url)
+            .header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
         if let Some(token) = &token {
             request = request.bearer_auth(&token.token);
         }
         let request = request.build()?;
         let response = client.execute(request).await?;
-        
+
         let reader = ResponseAsyncReader::new(response);
         let mut decomp = async_compression::tokio::bufread::GzipDecoder::new(reader);
         let mut buf = [0u8; 4096];
@@ -249,29 +371,25 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum SubCommand {
-    Download {
-        images: Vec<String>
-    }
+    Download { images: Vec<String> },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = dbg!(Args::parse());
-    
+
     // analyze(&image_tar_name);
     match args.command {
         SubCommand::Download { images } => {
-            let futures: Vec<_> = images.into_iter().map(|img| tokio::spawn(async move {
-                download(&img).await
-            })).collect();
-
-            let mut layers = Vec::new();
-            for f in futures {
-                let m = f.await??;
-                layers.extend(m.layers().iter().map(|l| l.digest().clone()));
+            let mut references = Vec::new();
+            for img in images {
+                references.push(docker_registry_v2::ParsedImageReference::from_str(&img)?);
             }
+
+            download_a_bunch(&references).await?;
+            println!("Basically done 2")
         }
     }
-    
+
     Ok(())
 }

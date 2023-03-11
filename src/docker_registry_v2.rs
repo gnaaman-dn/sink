@@ -91,7 +91,6 @@ impl Display for ParsedImageReference {
     }
 }
 
-
 fn split_zero_or_once(haystack: &str, needle: char) -> (&str, Option<&str>) {
     match haystack.split_once(needle) {
         None => (haystack, None),
@@ -150,7 +149,6 @@ impl FromStr for ParsedImageReference {
         })
     }
 }
-
 
 #[cfg(test)]
 mod tests {
