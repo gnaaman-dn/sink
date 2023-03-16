@@ -6,7 +6,7 @@ use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use sha2::{Sha256, digest::FixedOutput};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{Seek, Write},
     str::FromStr,
@@ -393,6 +393,8 @@ async fn download_a_bunch(images: &[ParsedImageReference]) -> anyhow::Result<()>
             Ok::<_, anyhow::Error>((digest, file))
         }
     });
+
+    let mut used_layers = HashSet::new();
     let mut layers: HashMap<_, _> = futures::future::try_join_all(layer_futures)
         .await?
         .into_iter()
@@ -403,6 +405,10 @@ async fn download_a_bunch(images: &[ParsedImageReference]) -> anyhow::Result<()>
         let mut image_tar = tar::Builder::new(&mut file);
         for layer in manifest_bundle.manifest.layers() {
             let digest = layer.digest();
+            if used_layers.contains(&*digest) {
+                eprintln!("Skipping {digest}, it was already used in one of the previous layers");
+                continue;
+            }
             let layer_file = layers.get_mut(digest).unwrap();
 
             layer_file.seek(std::io::SeekFrom::Start(0))?;
@@ -410,6 +416,7 @@ async fn download_a_bunch(images: &[ParsedImageReference]) -> anyhow::Result<()>
                 format!("blobs/sha256/{}", digest.split(':').nth(1).unwrap()),
                 layer_file,
             )?;
+            used_layers.insert(&*digest);
         }
 
         // Write image config to blobs
