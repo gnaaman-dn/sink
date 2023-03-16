@@ -42,7 +42,7 @@ impl Display for Tag {
         f.write_str(&self.tag)?;
         if let Some(digest) = &self.digest {
             f.write_char('@')?;
-            f.write_str(&digest)?;
+            f.write_str(digest)?;
         }
         Ok(())
     }
@@ -134,12 +134,12 @@ impl FromStr for ParsedImageReference {
 
         let (repository, tag) = split_zero_or_once(repository, ':');
 
-        let tag = tag.and_then(|repository_tag| {
+        let tag = tag.map(|repository_tag| {
             let (tag, digest) = split_zero_or_once(repository_tag, '@');
-            Some(Tag {
+            Tag {
                 tag: tag.to_owned(),
                 digest: digest.map(ToOwned::to_owned),
-            })
+            }
         });
 
         Ok(ParsedImageReference {
