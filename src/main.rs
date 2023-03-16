@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use oci_spec::image::{DescriptorBuilder, ImageConfiguration, ImageIndex, ImageManifest};
 use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
@@ -13,10 +14,10 @@ use std::{
     time::Instant,
 };
 
+pub mod analyze;
 pub mod docker_registry_v2;
 pub mod response_async_reader;
 pub mod ye_old_docker;
-pub mod analyze;
 
 use docker_registry_v2::{ParsedDomain, ParsedImageReference};
 
@@ -250,16 +251,28 @@ async fn download_a_bunch(
     });
     let manifests = futures::future::try_join_all(manifest_requests).await?;
 
+    let multi_progress_bar = &indicatif::MultiProgress::new();
+    let progress_style = ProgressStyle::with_template(
+        "{msg}\t{percent:>3}% {bar:40.cyan/blue} {binary_bytes_per_sec}",
+    )
+    .unwrap();
+
     // Aggregate layer digests to download.
+    eprintln!("Downloading layers");
     let mut layer_digests = HashMap::new();
-    for (manifest_bundle, img_ref) in manifests.iter().zip(images.iter()) {
+    for (idx, (manifest_bundle, img_ref)) in manifests.iter().zip(images.iter()).enumerate() {
         for layer in manifest_bundle.manifest.layers() {
-            layer_digests.insert(layer.digest().clone(), img_ref);
+            let prog = multi_progress_bar.insert(
+                idx,
+                ProgressBar::new(layer.size() as u64).with_style(progress_style.clone()),
+            );
+            prog.set_message(layer.digest().clone());
+            layer_digests.insert(layer.digest().clone(), (img_ref, prog));
         }
     }
 
     // Create a download-future for each layer
-    let layer_futures = layer_digests.iter().map(|(digest, img_ref)| {
+    let layer_futures = layer_digests.into_iter().map(|(digest, (img_ref, prog))| {
         let (registry, repository_namespace) = get_registry(&img_ref.registry);
 
         let url = format!(
@@ -275,21 +288,24 @@ async fn download_a_bunch(
         }
 
         async move {
-            eprintln!(">> Starting to download {digest}");
             let mut file = File::options()
                 .create(true)
                 .write(true)
                 .truncate(true)
                 .read(true)
-                .open(digest)?;
+                .open(&digest)?;
             let response = request.send().await?;
 
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
-                file.write_all(&chunk?)?;
+                let chunk = chunk?;
+                file.write_all(&chunk)?;
+                prog.inc(chunk.len() as u64);
             }
 
-            eprintln!(">> Finished downloading {digest}");
+            prog.finish();
+
+            // eprintln!(">> Finished downloading {digest}");
             Ok::<_, anyhow::Error>((digest, file))
         }
     });
@@ -301,17 +317,19 @@ async fn download_a_bunch(
         .collect();
 
     for (manifest_bundle, img_ref) in manifests.iter().zip(images.iter()) {
-        let mut file = File::create(format!(
+        let file_name = format!(
             "{}:{}.tar",
             img_ref.repository,
             img_ref.tag.as_ref().map(|x| &*x.tag).unwrap_or("latest")
-        ))?;
+        );
+        eprintln!("Generating `{file_name}`");
+        let mut file = File::create(file_name)?;
 
         let mut image_tar = tar::Builder::new(&mut file);
         for layer in manifest_bundle.manifest.layers() {
             let digest = layer.digest();
             if deduplicate_layers && used_layers.contains(digest) {
-                eprintln!("Skipping {digest}, it was already used in one of the previous layers");
+                eprintln!("\tSkipping {digest}");
                 continue;
             }
             let layer_file = layers.get_mut(digest).unwrap();
@@ -444,7 +462,7 @@ enum SubCommand {
     },
 }
 
-#[tokio::main(worker_threads = 4)]
+#[tokio::main/*(worker_threads = 4)*/]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
@@ -463,12 +481,7 @@ async fn main() -> anyhow::Result<()> {
                 references.push(docker_registry_v2::ParsedImageReference::from_str(&img)?);
             }
 
-            let f = download_a_bunch(
-                &references,
-                deduplicate,
-                rename_registry.as_deref(),
-            )
-            .await;
+            let f = download_a_bunch(&references, deduplicate, rename_registry.as_deref()).await;
 
             match &f {
                 Ok(_) => {}

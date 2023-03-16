@@ -1,3 +1,4 @@
+#[allow(unused)]
 fn bytes_to_human_size(byte_size: u64) -> (f64, &'static str) {
     if byte_size > 1024 * 1024 * 1024 {
         (byte_size as f64 / (1024.0 * 1024.0 * 1024.0), "GiB")

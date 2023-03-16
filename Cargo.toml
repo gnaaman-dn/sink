@@ -13,6 +13,7 @@ clap = { version = "4.1.8", features = ["derive"] }
 flate2 = "1.0.25"
 futures = "0.3.26"
 futures-core = "0.3.26"
+indicatif = { version = "0.17.3", features = ["tokio"] }
 memmap2 = "0.5.10"
 oci-spec = "0.6.0"
 rayon = "1.7.0"
