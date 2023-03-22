@@ -1,8 +1,11 @@
 use anyhow::Context;
+use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
-use oci_spec::image::{DescriptorBuilder, ImageConfiguration, ImageIndex, ImageManifest};
+use oci_spec::image::{
+    DescriptorBuilder, ImageConfiguration, ImageIndex, ImageManifest, MediaType,
+};
 use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
 use sha2::{digest::FixedOutput, Sha256};
@@ -10,13 +13,13 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     io::{Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     str::FromStr,
     time::Instant,
 };
 
 pub mod analyze;
 pub mod docker_registry_v2;
-pub mod response_async_reader;
 pub mod ye_old_docker;
 
 use docker_registry_v2::{ParsedDomain, ParsedImageReference};
@@ -38,6 +41,14 @@ fn hash_string(src: &str) -> String {
         .map(|b| format!("{b:02x}"))
         .collect();
     byte_strings.join("")
+}
+
+fn is_media_type_gzipped(media_type: &MediaType) -> bool {
+    match media_type {
+        MediaType::ImageLayerGzip => true,
+        MediaType::Other(s) if s == "application/vnd.docker.image.rootfs.diff.tar.gzip" => true,
+        _ => false,
+    }
 }
 
 // # Get Docker token (this function is useless for unauthenticated registries like Microsoft)
@@ -208,13 +219,31 @@ async fn get_manifest(
     })
 }
 
+async fn stream_to_output(
+    mut stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+    mut output: impl Write,
+    prog: ProgressBar,
+) -> anyhow::Result<()> {
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        output.write_all(&chunk)?;
+        prog.inc(chunk.len() as u64);
+    }
+    Ok(())
+}
+
 async fn download_a_bunch(
     images: &[ParsedImageReference],
     deduplicate_layers: bool,
+    decompress_layers: bool,
     rename_registry: Option<&str>,
+    output_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
     let mut registries = HashMap::new();
+    let output_dir = output_dir.unwrap_or(Path::new("."));
+
+    std::fs::create_dir_all(output_dir)?;
 
     for img_ref in images {
         let (registry, repository_namespace) = get_registry(&img_ref.registry);
@@ -267,48 +296,56 @@ async fn download_a_bunch(
                 ProgressBar::new(layer.size() as u64).with_style(progress_style.clone()),
             );
             prog.set_message(layer.digest().clone());
-            layer_digests.insert(layer.digest().clone(), (img_ref, prog));
+            layer_digests.insert(layer.digest().clone(), (layer.clone(), img_ref, prog));
         }
     }
 
     // Create a download-future for each layer
-    let layer_futures = layer_digests.into_iter().map(|(digest, (img_ref, prog))| {
-        let (registry, repository_namespace) = get_registry(&img_ref.registry);
+    let layer_futures = layer_digests
+        .into_iter()
+        .map(|(digest, (layer, img_ref, prog))| {
+            let (registry, repository_namespace) = get_registry(&img_ref.registry);
 
-        let url = format!(
-            "https://{registry}/v2/{repository_namespace}{}/blobs/{digest}",
-            img_ref.repository
-        );
-        let token = tokens.get(&registry).unwrap();
-        let mut request = client
-            .request(Method::GET, url)
-            .header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
-        if let Some(token) = &token {
-            request = request.bearer_auth(&token.token);
-        }
-
-        async move {
-            let mut file = File::options()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .read(true)
-                .open(&digest)?;
-            let response = request.send().await?;
-
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                file.write_all(&chunk)?;
-                prog.inc(chunk.len() as u64);
+            let url = format!(
+                "https://{registry}/v2/{repository_namespace}{}/blobs/{digest}",
+                img_ref.repository
+            );
+            let token = tokens.get(&registry).unwrap();
+            let mut request = client
+                .request(Method::GET, url)
+                .header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
+            if let Some(token) = &token {
+                request = request.bearer_auth(&token.token);
             }
 
-            prog.finish();
+            async move {
+                let layer_path = {
+                    let mut p = output_dir.to_path_buf();
+                    p.push(&digest);
+                    p
+                };
+                let mut file = File::options()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .read(true)
+                    .open(layer_path)?;
+                let response = request.send().await?;
 
-            // eprintln!(">> Finished downloading {digest}");
-            Ok::<_, anyhow::Error>((digest, file))
-        }
-    });
+                let stream = response.bytes_stream();
+                if decompress_layers && is_media_type_gzipped(layer.media_type()) {
+                    let mut decoder = flate2::write::GzDecoder::new(&mut file);
+                    stream_to_output(stream, &mut decoder, prog.clone()).await?;
+                    decoder.finish()?;
+                } else {
+                    stream_to_output(stream, &mut file, prog.clone()).await?;
+                }
+
+                prog.finish();
+
+                Ok::<_, anyhow::Error>((digest, file))
+            }
+        });
 
     let mut used_layers = HashSet::new();
     let mut layers: HashMap<_, _> = futures::future::try_join_all(layer_futures)
@@ -323,7 +360,12 @@ async fn download_a_bunch(
             img_ref.tag.as_ref().map(|x| &*x.tag).unwrap_or("latest")
         );
         eprintln!("Generating `{file_name}`");
-        let mut file = File::create(file_name)?;
+        let file_path = {
+            let mut path = output_dir.to_path_buf();
+            path.push(&file_name);
+            path
+        };
+        let mut file = File::create(file_path)?;
 
         let mut image_tar = tar::Builder::new(&mut file);
         for layer in manifest_bundle.manifest.layers() {
@@ -347,11 +389,22 @@ async fn download_a_bunch(
         )?;
 
         // Write image manifest to blobs
-        let manifest_digest = hash_string(&manifest_bundle.raw_manifest);
+        let mut manifest = manifest_bundle.manifest.clone();
+
+        // Modify manifest to account for decompression.
+        if decompress_layers {
+            manifest.layers_mut().iter_mut().for_each(|layer| {
+                if is_media_type_gzipped(layer.media_type()) {
+                    layer.set_media_type(MediaType::ImageLayer);
+                }
+            });
+        }
+        let raw_manifest = serde_json::to_string(&manifest)?;
+        let manifest_digest = hash_string(&raw_manifest);
         push_file_data(
             &mut image_tar,
             &format!("blobs/sha256/{manifest_digest}"),
-            manifest_bundle.raw_manifest.as_bytes(),
+            raw_manifest.as_bytes(),
         )?;
 
         // Write "oci-layout" file
@@ -406,10 +459,8 @@ async fn download_a_bunch(
         push_file_data(&mut image_tar, "index.json", raw_index.as_bytes())?;
 
         // Write legacy docker `manifest.json`
-        let ye_old_manifest = ye_old_docker::YeOldManifest::from_oci_manifest(
-            &manifest_bundle.manifest,
-            image_name.clone(),
-        );
+        let ye_old_manifest =
+            ye_old_docker::YeOldManifest::from_oci_manifest(&manifest, image_name.clone());
         let ye_old_manifest = serde_json::to_string(&ye_old_manifest)?;
         let ye_old_manifest = format!("[{ye_old_manifest}]");
         push_file_data(&mut image_tar, "manifest.json", ye_old_manifest.as_bytes())?;
@@ -418,7 +469,12 @@ async fn download_a_bunch(
     }
 
     for layer in layers.keys() {
-        std::fs::remove_file(layer)?;
+        let file_path = {
+            let mut path = output_dir.to_path_buf();
+            path.push(layer);
+            path
+        };
+        std::fs::remove_file(file_path)?;
     }
 
     println!("Basically done {:?}", start.elapsed());
@@ -453,9 +509,16 @@ enum SubCommand {
         #[arg(long)]
         deduplicate: bool,
 
+        /// Decompress the downloaded layers if they are gzipped.
+        #[arg(long)]
+        decompress_layers: bool,
+
         /// Rename and set the registry when tagging the images
         #[arg(long)]
         rename_registry: Option<String>,
+
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
     },
     Analyze {
         tar_file: String,
@@ -475,13 +538,22 @@ async fn main() -> anyhow::Result<()> {
             images,
             deduplicate,
             rename_registry,
+            decompress_layers,
+            output_dir,
         } => {
             let mut references = Vec::new();
             for img in images {
                 references.push(docker_registry_v2::ParsedImageReference::from_str(&img)?);
             }
 
-            let f = download_a_bunch(&references, deduplicate, rename_registry.as_deref()).await;
+            let f = download_a_bunch(
+                &references,
+                deduplicate,
+                decompress_layers,
+                rename_registry.as_deref(),
+                output_dir.as_deref(),
+            )
+            .await;
 
             match &f {
                 Ok(_) => {}
