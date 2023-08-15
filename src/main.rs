@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use futures::{Stream, StreamExt};
@@ -11,6 +11,7 @@ use serde::Deserialize;
 use sha2::{digest::FixedOutput, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    error::Error,
     fs::File,
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -78,6 +79,22 @@ struct AuthToken {
     expires_in: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RegistryAuthInfo {
+    uses_https: bool,
+    auth_token: Option<AuthToken>,
+}
+
+impl RegistryAuthInfo {
+    pub fn protocol(&self) -> &'static str {
+        if self.uses_https {
+            "https"
+        } else {
+            "http"
+        }
+    }
+}
+
 /// Probe the target registry for authentication.
 /// If necessary, request for an OAuth token for pulling from the specified repositories.
 ///
@@ -87,12 +104,25 @@ async fn get_auth_token(
     registry: &str,
     repository_namespace: &str,
     repositories: impl Iterator<Item = &str>,
-) -> anyhow::Result<Option<AuthToken>> {
-    let url = format!("https://{registry}/v2/");
+) -> anyhow::Result<RegistryAuthInfo> {
+    let url = dbg!(format!("https://{registry}/v2/"));
 
-    let response = client.get(url).send().await?;
+    let mut uses_https = true;
+    let response = match client.get(url).send().await {
+        Err(e) => {
+            // If we got a connection error, try downgrading to http
+            if e.is_connect() {
+                let url = format!("http://{registry}/v2/");
+                uses_https = false;
+                client.get(url).send().await?
+            } else {
+                bail!(e);
+            }
+        }
+        Ok(r) => r,
+    };
 
-    if response.status() == StatusCode::UNAUTHORIZED {
+    let auth_token = if response.status() == StatusCode::UNAUTHORIZED {
         let auth = response.headers().get("WWW-Authenticate").unwrap();
         let auth = parse_authentication_header(auth.to_str()?);
         let auth_url = auth["Bearer realm"];
@@ -115,10 +145,19 @@ async fn get_auth_token(
         if let Err(_e) = &parsed_response {
             println!("{response}");
         };
-        Ok(Some(parsed_response?))
+        Some(parsed_response?)
     } else {
-        Ok(None)
+        None
+    };
+
+    if !uses_https {
+        eprintln!("WARNING: Registry {registry} is using unencrypted HTTP");
     }
+
+    Ok(RegistryAuthInfo {
+        auth_token,
+        uses_https,
+    })
 }
 
 fn get_registry(parsed_domain: &Option<ParsedDomain>) -> (String, &'static str) {
@@ -156,13 +195,14 @@ async fn get_manifest(
     // url_base: String,
     // tag: &str,
     img_ref: &ParsedImageReference,
-    token: Option<&AuthToken>,
+    auth_info: &RegistryAuthInfo,
 ) -> anyhow::Result<ManifestBundle> {
     let (registry, repository_namespace) = get_registry(&img_ref.registry);
 
     let url_base = format!(
-        "https://{registry}/v2/{repository_namespace}{}/",
+        "{protocol}://{registry}/v2/{repository_namespace}{}/",
         img_ref.repository,
+        protocol = auth_info.protocol(),
     );
 
     let tag = img_ref
@@ -175,7 +215,7 @@ async fn get_manifest(
     let mut request = client
         .request(Method::GET, &url)
         .header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
-    if let Some(token) = token {
+    if let Some(token) = &auth_info.auth_token {
         request = request.bearer_auth(&token.token);
     };
 
@@ -196,7 +236,7 @@ async fn get_manifest(
     let config_url = format!("{url_base}/blobs/{config_digest}");
 
     let mut request = client.request(Method::GET, &config_url);
-    if let Some(token) = token {
+    if let Some(token) = &auth_info.auth_token {
         request = request.bearer_auth(&token.token);
     };
     let response = request.send().await?;
@@ -275,7 +315,7 @@ async fn download_a_bunch(
     // Get manifest for each image
     let manifest_requests = images.iter().map(|img_ref| {
         let (registry, _repository_namespace) = get_registry(&img_ref.registry);
-        let token = tokens.get(&registry).and_then(|t| t.as_ref());
+        let token = tokens.get(&registry).unwrap();
         get_manifest(client.clone(), img_ref, token)
     });
     let manifests = futures::future::try_join_all(manifest_requests).await?;
@@ -306,15 +346,16 @@ async fn download_a_bunch(
         .map(|(digest, (layer, img_ref, prog))| {
             let (registry, repository_namespace) = get_registry(&img_ref.registry);
 
-            let url = format!(
-                "https://{registry}/v2/{repository_namespace}{}/blobs/{digest}",
-                img_ref.repository
-            );
             let token = tokens.get(&registry).unwrap();
+            let url = format!(
+                "{protocol}://{registry}/v2/{repository_namespace}{}/blobs/{digest}",
+                img_ref.repository,
+                protocol = token.protocol(),
+            );
             let mut request = client
                 .request(Method::GET, url)
                 .header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
-            if let Some(token) = &token {
+            if let Some(token) = &token.auth_token {
                 request = request.bearer_auth(&token.token);
             }
 
