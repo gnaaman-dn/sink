@@ -88,7 +88,7 @@ async fn get_auth_token(
     repository_namespace: &str,
     repositories: impl Iterator<Item = &str>,
 ) -> anyhow::Result<Option<AuthToken>> {
-    let url = format!("https://{registry}/v2/");
+    let url = format!("http://{registry}/v2/");
 
     let response = client.get(url).send().await?;
 
@@ -161,7 +161,7 @@ async fn get_manifest(
     let (registry, repository_namespace) = get_registry(&img_ref.registry);
 
     let url_base = format!(
-        "https://{registry}/v2/{repository_namespace}{}/",
+        "http://{registry}/v2/{repository_namespace}{}/",
         img_ref.repository,
     );
 
@@ -482,6 +482,267 @@ async fn download_a_bunch(
     Ok(())
 }
 
+async fn create_delta(
+    from: ParsedImageReference,
+    to: ParsedImageReference,
+    deduplicate_layers: bool,
+    decompress_layers: bool,
+    rename_registry: Option<&str>,
+    output_dir: Option<&Path>,
+) -> anyhow::Result<()> {
+    let start = Instant::now();
+    let mut registries = HashMap::new();
+    let output_dir = output_dir.unwrap_or(Path::new("."));
+
+    std::fs::create_dir_all(output_dir)?;
+    let images = [&from, &to];
+
+    for img_ref in &images {
+        let (registry, repository_namespace) = get_registry(&img_ref.registry);
+        let (_, repositories) = registries
+            .entry(registry)
+            .or_insert((repository_namespace, Vec::new()));
+        repositories.push((img_ref.repository.clone(), img_ref.tag.clone()));
+    }
+
+    let client = reqwest::Client::new();
+
+    // Get auth tokens for each repository.
+    let token_futures = registries
+        .iter()
+        .map(|(registry, (namespace, repositories))| {
+            let future = get_auth_token(
+                client.clone(),
+                registry,
+                namespace,
+                repositories.iter().map(|(repo, _tag)| repo.as_str()),
+            );
+            async { future.await.map(|token| (registry.clone(), token)) }
+        });
+    let tokens: HashMap<_, _> = futures::future::try_join_all(token_futures)
+        .await?
+        .into_iter()
+        .collect();
+
+    // Get manifest for each image
+    let manifest_requests = images.iter().map(|img_ref| {
+        let (registry, _repository_namespace) = get_registry(&img_ref.registry);
+        let token = tokens.get(&registry).and_then(|t| t.as_ref());
+        get_manifest(client.clone(), img_ref, token)
+    });
+    let manifests = futures::future::try_join_all(manifest_requests).await?;
+
+    let [from_manifest, to_manifest] = &*manifests else { unreachable!() };
+    let from_layers = from_manifest.manifest.layers();
+    let to_layers = to_manifest.manifest.layers();
+    let (prefix, delta) = to_layers.split_at(from_layers.len());
+    assert_eq!(from_layers, prefix);
+    eprintln!("{:#?}\n\n{:#?}\n\n{:#?}", from_layers, prefix, delta);
+    // panic!();
+
+    let multi_progress_bar = &indicatif::MultiProgress::new();
+    let progress_style = ProgressStyle::with_template(
+        "{msg}\t{percent:>3}% {bar:40.cyan/blue} {binary_bytes_per_sec}",
+    )
+    .unwrap();
+
+    // Aggregate layer digests to download.
+    eprintln!("Downloading layers");
+    let mut layer_digests = HashMap::new();
+    for layer in delta {
+        let prog = multi_progress_bar.insert(
+            0,
+            ProgressBar::new(layer.size() as u64).with_style(progress_style.clone()),
+        );
+        prog.set_message(layer.digest().clone());
+        layer_digests.insert(layer.digest().clone(), (layer.clone(), &to, prog));
+    }
+
+    // Create a download-future for each layer
+    let layer_futures = layer_digests
+        .into_iter()
+        .map(|(digest, (layer, img_ref, prog))| {
+            let (registry, repository_namespace) = get_registry(&img_ref.registry);
+
+            let url = format!(
+                "http://{registry}/v2/{repository_namespace}{}/blobs/{digest}",
+                img_ref.repository
+            );
+            let token = tokens.get(&registry).unwrap();
+            let mut request = client
+                .request(Method::GET, url)
+                .header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
+            if let Some(token) = &token {
+                request = request.bearer_auth(&token.token);
+            }
+
+            async move {
+                let layer_path = {
+                    let mut p = output_dir.to_path_buf();
+                    p.push(&digest);
+                    p
+                };
+                let mut file = File::options()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .read(true)
+                    .open(layer_path)?;
+                let response = request.send().await?;
+
+                let stream = response.bytes_stream();
+                if decompress_layers && is_media_type_gzipped(layer.media_type()) {
+                    let mut decoder = flate2::write::GzDecoder::new(&mut file);
+                    stream_to_output(stream, &mut decoder, prog.clone()).await?;
+                    decoder.finish()?;
+                } else {
+                    stream_to_output(stream, &mut file, prog.clone()).await?;
+                }
+
+                prog.finish();
+
+                Ok::<_, anyhow::Error>((digest, file))
+            }
+        });
+
+    let mut used_layers = HashSet::new();
+    used_layers.extend(prefix.iter().map(|layer| layer.digest()));
+
+    let mut layers: HashMap<_, _> = futures::future::try_join_all(layer_futures)
+        .await?
+        .into_iter()
+        .collect();
+
+    for (manifest_bundle, img_ref) in manifests.iter().zip(images.iter()).skip(1) {
+        let file_name = format!(
+            "{}:{}.tar",
+            img_ref.repository,
+            img_ref.tag.as_ref().map(|x| &*x.tag).unwrap_or("latest")
+        );
+        eprintln!("Generating `{file_name}`");
+        let file_path = {
+            let mut path = output_dir.to_path_buf();
+            path.push(&file_name);
+            path
+        };
+        let mut file = File::create(file_path)?;
+
+        let mut image_tar = tar::Builder::new(&mut file);
+        for layer in manifest_bundle.manifest.layers() {
+            let digest = layer.digest();
+            if deduplicate_layers && used_layers.contains(digest) {
+                eprintln!("\tSkipping {digest}");
+                continue;
+            }
+            let layer_file = layers.get_mut(digest).unwrap();
+
+            layer_file.seek(SeekFrom::Start(0))?;
+            image_tar.append_file(layer_digest_to_blob_path(digest), layer_file)?;
+            used_layers.insert(digest);
+        }
+
+        // Write image config to blobs
+        push_file_data(
+            &mut image_tar,
+            &layer_digest_to_blob_path(manifest_bundle.manifest.config().digest()),
+            manifest_bundle.raw_config.as_bytes(),
+        )?;
+
+        // Write image manifest to blobs
+        let mut manifest = manifest_bundle.manifest.clone();
+
+        // Modify manifest to account for decompression.
+        if decompress_layers {
+            manifest.layers_mut().iter_mut().for_each(|layer| {
+                if is_media_type_gzipped(layer.media_type()) {
+                    layer.set_media_type(MediaType::ImageLayer);
+                }
+            });
+        }
+        let raw_manifest = serde_json::to_string(&manifest)?;
+        let manifest_digest = hash_string(&raw_manifest);
+        push_file_data(
+            &mut image_tar,
+            &format!("blobs/sha256/{manifest_digest}"),
+            raw_manifest.as_bytes(),
+        )?;
+
+        // Write "oci-layout" file
+        push_file_data(
+            &mut image_tar,
+            "oci-layout",
+            b"{\"imageLayoutVersion\":\"1.0.0\"}",
+        )?;
+
+        // Write index.json
+        let ref_name = img_ref
+            .tag
+            .as_ref()
+            .map(|t| &*t.tag)
+            .unwrap_or("latest")
+            .to_string();
+
+        let mut image_name = String::new();
+
+        if let Some(registry) = rename_registry {
+            image_name.push_str(registry);
+            image_name.push('/');
+        } else if let Some(registry) = &img_ref.registry {
+            image_name.push_str(&registry.to_string());
+            image_name.push('/');
+        }
+        image_name.push_str(&img_ref.repository);
+        image_name.push(':');
+        image_name.push_str(&ref_name);
+
+        let mut index = ImageIndex::default();
+        let manifest_descriptor = DescriptorBuilder::default()
+            .digest(format!("sha256:{manifest_digest}"))
+            .size(manifest_bundle.raw_manifest.len() as i64)
+            .media_type(
+                manifest_bundle
+                    .manifest
+                    .media_type()
+                    .as_ref()
+                    .unwrap()
+                    .clone(),
+            )
+            .annotations(HashMap::from([
+                ("io.containerd.image.name".into(), image_name.clone()),
+                ("org.opencontainers.image.ref.name".into(), ref_name),
+            ]))
+            .build()
+            .unwrap();
+        index.set_manifests(vec![manifest_descriptor]);
+        let raw_index = serde_json::to_string(&index).unwrap();
+
+        push_file_data(&mut image_tar, "index.json", raw_index.as_bytes())?;
+
+        // Write legacy docker `manifest.json`
+        let ye_old_manifest =
+            ye_old_docker::YeOldManifest::from_oci_manifest(&manifest, image_name.clone());
+        let ye_old_manifest = serde_json::to_string(&ye_old_manifest)?;
+        let ye_old_manifest = format!("[{ye_old_manifest}]");
+        push_file_data(&mut image_tar, "manifest.json", ye_old_manifest.as_bytes())?;
+
+        image_tar.finish()?;
+    }
+
+    for layer in layers.keys() {
+        let file_path = {
+            let mut path = output_dir.to_path_buf();
+            path.push(layer);
+            path
+        };
+        std::fs::remove_file(file_path)?;
+    }
+
+    println!("Basically done {:?}", start.elapsed());
+
+    Ok(())
+}
+
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -519,6 +780,10 @@ enum SubCommand {
 
         #[arg(long)]
         output_dir: Option<PathBuf>,
+    },
+    BuildDelta {
+        from: String,
+        to: String,  
     },
     Analyze {
         tar_file: String,
@@ -563,6 +828,11 @@ async fn main() -> anyhow::Result<()> {
             }
             f?;
             println!("Basically done 2")
+        }
+        SubCommand::BuildDelta { from, to } => {
+            let from = docker_registry_v2::ParsedImageReference::from_str(&from)?;
+            let to = docker_registry_v2::ParsedImageReference::from_str(&to)?;
+            create_delta(from, to, true, true, None, None).await.unwrap();
         }
     }
 
