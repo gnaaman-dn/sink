@@ -207,7 +207,7 @@ async fn get_registries_for_image_set(
 }
 
 /// Download a set of layers into the output directory.
-/// 
+///
 /// Each layer digest must be paired with *an* image reference of one of the images
 /// that referenced that layer, since the registry protocol requires it as an index.
 /// It doesn't matter which image, though.
@@ -390,6 +390,111 @@ async fn stream_to_output(
     Ok(())
 }
 
+fn package_single_image(
+    img_ref: &ParsedImageReference,
+    output_dir: &Path,
+    manifest_bundle: &ManifestBundle,
+    ignored_layers: &HashSet<&String>,
+    layers: &mut HashMap<String, File>,
+    decompress_layers: bool,
+    rename_registry: Option<&str>,
+) -> Result<(), anyhow::Error> {
+    let file_name = format!(
+        "{}:{}.tar",
+        img_ref.repository,
+        img_ref.tag.as_ref().map(|x| &*x.tag).unwrap_or("latest")
+    );
+    eprintln!("Generating `{file_name}`");
+    let file_path = {
+        let mut path = output_dir.to_path_buf();
+        path.push(&file_name);
+        path
+    };
+    let mut file = File::create(file_path)?;
+    let mut image_tar = tar::Builder::new(&mut file);
+    for layer in manifest_bundle.manifest.layers() {
+        let digest = layer.digest();
+        if ignored_layers.contains(digest) {
+            eprintln!("\tSkipping {digest}");
+            continue;
+        }
+        let layer_file = layers.get_mut(digest).unwrap();
+
+        layer_file.seek(SeekFrom::Start(0))?;
+        image_tar.append_file(layer_digest_to_blob_path(digest), layer_file)?;
+    }
+    push_file_data(
+        &mut image_tar,
+        &layer_digest_to_blob_path(manifest_bundle.manifest.config().digest()),
+        manifest_bundle.raw_config.as_bytes(),
+    )?;
+    let mut manifest = manifest_bundle.manifest.clone();
+    if decompress_layers {
+        manifest.layers_mut().iter_mut().for_each(|layer| {
+            if is_media_type_gzipped(layer.media_type()) {
+                layer.set_media_type(MediaType::ImageLayer);
+            }
+        });
+    }
+    let raw_manifest = serde_json::to_string(&manifest)?;
+    let manifest_digest = hash_string(&raw_manifest);
+    push_file_data(
+        &mut image_tar,
+        &format!("blobs/sha256/{manifest_digest}"),
+        raw_manifest.as_bytes(),
+    )?;
+    push_file_data(
+        &mut image_tar,
+        "oci-layout",
+        b"{\"imageLayoutVersion\":\"1.0.0\"}",
+    )?;
+    let ref_name = img_ref
+        .tag
+        .as_ref()
+        .map(|t| &*t.tag)
+        .unwrap_or("latest")
+        .to_string();
+    let mut image_name = String::new();
+    if let Some(registry) = rename_registry {
+        image_name.push_str(registry);
+        image_name.push('/');
+    } else if let Some(registry) = &img_ref.registry {
+        image_name.push_str(&registry.to_string());
+        image_name.push('/');
+    }
+    image_name.push_str(&img_ref.repository);
+    image_name.push(':');
+    image_name.push_str(&ref_name);
+    let mut index = ImageIndex::default();
+    let manifest_descriptor = DescriptorBuilder::default()
+        .digest(format!("sha256:{manifest_digest}"))
+        .size(manifest_bundle.raw_manifest.len() as i64)
+        .media_type(
+            manifest_bundle
+                .manifest
+                .media_type()
+                .as_ref()
+                .unwrap()
+                .clone(),
+        )
+        .annotations(HashMap::from([
+            ("io.containerd.image.name".into(), image_name.clone()),
+            ("org.opencontainers.image.ref.name".into(), ref_name),
+        ]))
+        .build()
+        .unwrap();
+    index.set_manifests(vec![manifest_descriptor]);
+    let raw_index = serde_json::to_string(&index).unwrap();
+    push_file_data(&mut image_tar, "index.json", raw_index.as_bytes())?;
+    let ye_old_manifest =
+        ye_old_docker::YeOldManifest::from_oci_manifest(&manifest, image_name.clone());
+    let ye_old_manifest = serde_json::to_string(&ye_old_manifest)?;
+    let ye_old_manifest = format!("[{ye_old_manifest}]");
+    push_file_data(&mut image_tar, "manifest.json", ye_old_manifest.as_bytes())?;
+    image_tar.finish()?;
+    Ok(())
+}
+
 async fn download_a_bunch(
     images: &[ParsedImageReference],
     deduplicate_layers: bool,
@@ -437,118 +542,25 @@ async fn download_a_bunch(
     let mut used_layers = HashSet::new();
 
     for (manifest_bundle, img_ref) in manifests.iter().zip(images.iter()) {
-        let file_name = format!(
-            "{}:{}.tar",
-            img_ref.repository,
-            img_ref.tag.as_ref().map(|x| &*x.tag).unwrap_or("latest")
-        );
-        eprintln!("Generating `{file_name}`");
-        let file_path = {
-            let mut path = output_dir.to_path_buf();
-            path.push(&file_name);
-            path
-        };
-        let mut file = File::create(file_path)?;
-
-        let mut image_tar = tar::Builder::new(&mut file);
-        for layer in manifest_bundle.manifest.layers() {
-            let digest = layer.digest();
-            if deduplicate_layers && used_layers.contains(digest) {
-                eprintln!("\tSkipping {digest}");
-                continue;
-            }
-            let layer_file = layers.get_mut(digest).unwrap();
-
-            layer_file.seek(SeekFrom::Start(0))?;
-            image_tar.append_file(layer_digest_to_blob_path(digest), layer_file)?;
-            used_layers.insert(digest);
-        }
-
-        // Write image config to blobs
-        push_file_data(
-            &mut image_tar,
-            &layer_digest_to_blob_path(manifest_bundle.manifest.config().digest()),
-            manifest_bundle.raw_config.as_bytes(),
+        package_single_image(
+            img_ref,
+            output_dir,
+            manifest_bundle,
+            &used_layers,
+            &mut layers,
+            decompress_layers,
+            rename_registry,
         )?;
 
-        // Write image manifest to blobs
-        let mut manifest = manifest_bundle.manifest.clone();
-
-        // Modify manifest to account for decompression.
-        if decompress_layers {
-            manifest.layers_mut().iter_mut().for_each(|layer| {
-                if is_media_type_gzipped(layer.media_type()) {
-                    layer.set_media_type(MediaType::ImageLayer);
-                }
-            });
-        }
-        let raw_manifest = serde_json::to_string(&manifest)?;
-        let manifest_digest = hash_string(&raw_manifest);
-        push_file_data(
-            &mut image_tar,
-            &format!("blobs/sha256/{manifest_digest}"),
-            raw_manifest.as_bytes(),
-        )?;
-
-        // Write "oci-layout" file
-        push_file_data(
-            &mut image_tar,
-            "oci-layout",
-            b"{\"imageLayoutVersion\":\"1.0.0\"}",
-        )?;
-
-        // Write index.json
-        let ref_name = img_ref
-            .tag
-            .as_ref()
-            .map(|t| &*t.tag)
-            .unwrap_or("latest")
-            .to_string();
-
-        let mut image_name = String::new();
-
-        if let Some(registry) = rename_registry {
-            image_name.push_str(registry);
-            image_name.push('/');
-        } else if let Some(registry) = &img_ref.registry {
-            image_name.push_str(&registry.to_string());
-            image_name.push('/');
-        }
-        image_name.push_str(&img_ref.repository);
-        image_name.push(':');
-        image_name.push_str(&ref_name);
-
-        let mut index = ImageIndex::default();
-        let manifest_descriptor = DescriptorBuilder::default()
-            .digest(format!("sha256:{manifest_digest}"))
-            .size(manifest_bundle.raw_manifest.len() as i64)
-            .media_type(
+        if deduplicate_layers {
+            used_layers.extend(
                 manifest_bundle
                     .manifest
-                    .media_type()
-                    .as_ref()
-                    .unwrap()
-                    .clone(),
-            )
-            .annotations(HashMap::from([
-                ("io.containerd.image.name".into(), image_name.clone()),
-                ("org.opencontainers.image.ref.name".into(), ref_name),
-            ]))
-            .build()
-            .unwrap();
-        index.set_manifests(vec![manifest_descriptor]);
-        let raw_index = serde_json::to_string(&index).unwrap();
-
-        push_file_data(&mut image_tar, "index.json", raw_index.as_bytes())?;
-
-        // Write legacy docker `manifest.json`
-        let ye_old_manifest =
-            ye_old_docker::YeOldManifest::from_oci_manifest(&manifest, image_name.clone());
-        let ye_old_manifest = serde_json::to_string(&ye_old_manifest)?;
-        let ye_old_manifest = format!("[{ye_old_manifest}]");
-        push_file_data(&mut image_tar, "manifest.json", ye_old_manifest.as_bytes())?;
-
-        image_tar.finish()?;
+                    .layers()
+                    .iter()
+                    .map(|layer| layer.digest()),
+            );
+        }
     }
 
     for layer in layers.keys() {
