@@ -11,7 +11,6 @@ use serde::Deserialize;
 use sha2::{digest::FixedOutput, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    error::Error,
     fs::File,
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -81,6 +80,8 @@ struct AuthToken {
 
 #[derive(Debug, Clone)]
 pub struct RegistryAuthInfo {
+    registry: String,
+    repository_namespace: String,
     uses_https: bool,
     auth_token: Option<AuthToken>,
 }
@@ -99,7 +100,7 @@ impl RegistryAuthInfo {
 /// If necessary, request for an OAuth token for pulling from the specified repositories.
 ///
 /// https://docs.docker.com/registry/spec/auth/token/#how-to-authenticate
-async fn get_auth_token(
+async fn get_auth_info(
     client: reqwest::Client,
     registry: &str,
     repository_namespace: &str,
@@ -157,6 +158,8 @@ async fn get_auth_token(
     Ok(RegistryAuthInfo {
         auth_token,
         uses_https,
+        registry: registry.into(),
+        repository_namespace: repository_namespace.into(),
     })
 }
 
@@ -166,6 +169,41 @@ fn get_registry(parsed_domain: &Option<ParsedDomain>) -> (String, &'static str) 
     } else {
         ("registry-1.docker.io".to_string(), "library/")
     }
+}
+
+async fn get_registries_for_image_set(
+    client: &reqwest::Client,
+    images: &[ParsedImageReference],
+) -> anyhow::Result<HashMap<String, RegistryAuthInfo>> {
+    let mut registry_to_repositories = HashMap::new();
+    for img_ref in images {
+        let (registry, repository_namespace) = get_registry(&img_ref.registry);
+        let (_, repositories) = registry_to_repositories
+            .entry(registry)
+            .or_insert((repository_namespace, Vec::new()));
+        repositories.push(img_ref.repository.clone());
+    }
+
+    // Get auth tokens for each repository.
+    let token_futures =
+        registry_to_repositories
+            .iter()
+            .map(|(registry, (namespace, repositories))| {
+                get_auth_info(
+                    client.clone(),
+                    registry,
+                    namespace,
+                    repositories.iter().map(|repo| repo.as_str()),
+                )
+            });
+
+    let registry_info: HashMap<_, _> = futures::future::try_join_all(token_futures)
+        .await?
+        .into_iter()
+        .map(|auth_info| (auth_info.registry.clone(), auth_info))
+        .collect();
+
+    Ok(registry_info)
 }
 
 fn push_file_data<W: Write>(
@@ -192,17 +230,15 @@ struct ManifestBundle {
 
 async fn get_manifest(
     client: Client,
-    // url_base: String,
-    // tag: &str,
     img_ref: &ParsedImageReference,
     auth_info: &RegistryAuthInfo,
 ) -> anyhow::Result<ManifestBundle> {
-    let (registry, repository_namespace) = get_registry(&img_ref.registry);
-
     let url_base = format!(
         "{protocol}://{registry}/v2/{repository_namespace}{}/",
         img_ref.repository,
         protocol = auth_info.protocol(),
+        registry = auth_info.registry,
+        repository_namespace = auth_info.repository_namespace,
     );
 
     let tag = img_ref
@@ -280,42 +316,17 @@ async fn download_a_bunch(
     output_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
-    let mut registries = HashMap::new();
     let output_dir = output_dir.unwrap_or(Path::new("."));
 
     std::fs::create_dir_all(output_dir)?;
-
-    for img_ref in images {
-        let (registry, repository_namespace) = get_registry(&img_ref.registry);
-        let (_, repositories) = registries
-            .entry(registry)
-            .or_insert((repository_namespace, Vec::new()));
-        repositories.push((img_ref.repository.clone(), img_ref.tag.clone()));
-    }
-
     let client = reqwest::Client::new();
 
-    // Get auth tokens for each repository.
-    let token_futures = registries
-        .iter()
-        .map(|(registry, (namespace, repositories))| {
-            let future = get_auth_token(
-                client.clone(),
-                registry,
-                namespace,
-                repositories.iter().map(|(repo, _tag)| repo.as_str()),
-            );
-            async { future.await.map(|token| (registry.clone(), token)) }
-        });
-    let tokens: HashMap<_, _> = futures::future::try_join_all(token_futures)
-        .await?
-        .into_iter()
-        .collect();
+    let registries = get_registries_for_image_set(&client, images).await?;
 
     // Get manifest for each image
     let manifest_requests = images.iter().map(|img_ref| {
         let (registry, _repository_namespace) = get_registry(&img_ref.registry);
-        let token = tokens.get(&registry).unwrap();
+        let token = registries.get(&registry).unwrap();
         get_manifest(client.clone(), img_ref, token)
     });
     let manifests = futures::future::try_join_all(manifest_requests).await?;
@@ -346,7 +357,7 @@ async fn download_a_bunch(
         .map(|(digest, (layer, img_ref, prog))| {
             let (registry, repository_namespace) = get_registry(&img_ref.registry);
 
-            let token = tokens.get(&registry).unwrap();
+            let token = registries.get(&registry).unwrap();
             let url = format!(
                 "{protocol}://{registry}/v2/{repository_namespace}{}/blobs/{digest}",
                 img_ref.repository,
