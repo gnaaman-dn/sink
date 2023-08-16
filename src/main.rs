@@ -577,6 +577,125 @@ async fn download_a_bunch(
     Ok(())
 }
 
+async fn download_delta(
+    from: ParsedImageReference,
+    to: ParsedImageReference,
+    decompress_layers: bool,
+    rename_registry: Option<&str>,
+    output_dir: Option<&Path>,
+) -> anyhow::Result<()> {
+    let start = Instant::now();
+    let output_dir = output_dir.unwrap_or(Path::new("."));
+
+    std::fs::create_dir_all(output_dir)?;
+    let client = reqwest::Client::new();
+
+    let images = [from.clone(), to.clone()];
+
+    let registries = get_registries_for_image_set(&client, &images).await?;
+
+    // Get manifest for each image
+    let [to_request, from_request] = images.map(|img_ref| {
+        let (registry, _repository_namespace) = get_registry(&img_ref.registry);
+        let token = registries.get(&registry).unwrap();
+        let client = client.clone();
+        async move { get_manifest(client.clone(), &img_ref, token).await }
+    });
+
+    let (from_manifest, to_manifest) = futures::try_join!(to_request, from_request)?;
+
+    let to_layers: HashSet<_> = to_manifest
+        .manifest
+        .layers()
+        .iter()
+        .map(|layer| layer.digest())
+        .collect();
+    let from_layers: HashSet<_> = from_manifest
+        .manifest
+        .layers()
+        .iter()
+        .map(|layer| layer.digest())
+        .collect();
+
+    /*
+     * Assuming our images look like so:
+     *
+     * ```
+     *  Original    Patch
+     *     Image    Image
+     *      ┌─┐     ┌─┐
+     *      │C│     │D│
+     *      └┬┘     └┬┘
+     *       ▼       │
+     *      ┌─┐      │
+     *      │B│◄─────┘
+     *      └┬┘
+     *       ▼
+     *      ┌─┐
+     *      │A│
+     *      └─┘
+     * ```
+     *
+     * `needed_delta` will be a set containing `D`,
+     * and `removed_layers` will be a set containing 'C'.
+     *
+     * `prefix`, containing `{A, B}`, is the set of layers shared by both images.
+     *
+     * If the new image is strictly an addition on top of the previous one,
+     * `removed_layers` will be empty.
+     */
+    let prefix: HashSet<_> = to_layers.intersection(&from_layers).copied().collect();
+    let needed_delta = to_layers.difference(&prefix);
+    let removed_layers = from_layers.difference(&prefix);
+    if removed_layers.count() > 0 {
+        eprintln!("WARNING: Patched image isn't a strict superset of the base image");
+    }
+
+    // Aggregate layer digests to download - create a hashmap to deduplicate layers between images.
+    let layer_digests = needed_delta.map(|digest| {
+        let layer = to_manifest
+            .manifest
+            .layers()
+            .iter()
+            .find(|layer| layer.digest() == *digest)
+            .unwrap();
+        (layer.clone(), &to)
+    });
+
+    let mut layers = download_layers(
+        &client,
+        output_dir,
+        decompress_layers,
+        layer_digests.clone(),
+        &registries,
+    )
+    .await?;
+
+    // Package the patch tarball, ignoring layers in `prefix`.
+    package_single_image(
+        &to,
+        output_dir,
+        &to_manifest,
+        &prefix,
+        &mut layers,
+        decompress_layers,
+        rename_registry,
+    )?;
+
+    for (layer, _) in layer_digests {
+        let file_path = {
+            let mut path = output_dir.to_path_buf();
+            path.push(layer.digest());
+            path
+        };
+        std::fs::remove_file(file_path)?;
+    }
+
+    println!("Basically done {:?}", start.elapsed());
+
+    Ok(())
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -603,6 +722,23 @@ enum SubCommand {
         /// Using this option might result in an image set that needs to be loaded in the same order as the input.
         #[arg(long)]
         deduplicate: bool,
+
+        /// Decompress the downloaded layers if they are gzipped.
+        #[arg(long)]
+        decompress_layers: bool,
+
+        /// Rename and set the registry when tagging the images
+        #[arg(long)]
+        rename_registry: Option<String>,
+
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+    },
+    /// Create a tarball for an image, sans any layers present in another image.
+    /// This can be used to deliver small "patches" containing only layers appeneded to an existing image.
+    Delta {
+        image: String,
+        base_image: String,
 
         /// Decompress the downloaded layers if they are gzipped.
         #[arg(long)]
@@ -650,6 +786,32 @@ async fn main() -> anyhow::Result<()> {
             )
             .await;
 
+            match &f {
+                Ok(_) => {}
+                Err(e) => {
+                    dbg!(&e, e.backtrace());
+                }
+            }
+            f?;
+            println!("Basically done 2")
+        }
+        SubCommand::Delta {
+            image,
+            base_image,
+            decompress_layers,
+            rename_registry,
+            output_dir,
+        } => {
+            let from = docker_registry_v2::ParsedImageReference::from_str(&base_image)?;
+            let to = docker_registry_v2::ParsedImageReference::from_str(&image)?;
+            let f = download_delta(
+                from,
+                to,
+                decompress_layers,
+                rename_registry.as_deref(),
+                output_dir.as_deref(),
+            )
+            .await;
             match &f {
                 Ok(_) => {}
                 Err(e) => {
