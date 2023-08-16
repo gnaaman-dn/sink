@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use futures::{Stream, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use oci_spec::image::{
-    DescriptorBuilder, ImageConfiguration, ImageIndex, ImageManifest, MediaType,
+    Descriptor, DescriptorBuilder, ImageConfiguration, ImageIndex, ImageManifest, MediaType,
 };
 use reqwest::{Client, Method, StatusCode};
 use serde::Deserialize;
@@ -206,6 +206,86 @@ async fn get_registries_for_image_set(
     Ok(registry_info)
 }
 
+/// Download a set of layers into the output directory.
+/// 
+/// Each layer digest must be paired with *an* image reference of one of the images
+/// that referenced that layer, since the registry protocol requires it as an index.
+/// It doesn't matter which image, though.
+async fn download_layers(
+    client: &reqwest::Client,
+    output_dir: &Path,
+    decompress_layers: bool,
+
+    layer_digests: impl Iterator<Item = (Descriptor, &ParsedImageReference)>,
+    registries: &HashMap<String, RegistryAuthInfo>,
+) -> anyhow::Result<HashMap<String, File>> {
+    eprintln!("Downloading layers");
+
+    let multi_progress_bar = &indicatif::MultiProgress::new();
+    let progress_style = ProgressStyle::with_template(
+        "{msg}\t{percent:>3}% {bar:40.cyan/blue} {binary_bytes_per_sec}",
+    )
+    .unwrap();
+
+    // Create a download-future for each layer
+    let layer_futures = layer_digests.into_iter().map(|(layer, img_ref)| {
+        let prog = multi_progress_bar.insert(
+            1000,
+            ProgressBar::new(layer.size() as u64).with_style(progress_style.clone()),
+        );
+        let digest = layer.digest().clone();
+        prog.set_message(layer.digest().clone());
+        let (registry, repository_namespace) = get_registry(&img_ref.registry);
+
+        let token = registries.get(&registry).unwrap();
+        let url = format!(
+            "{protocol}://{registry}/v2/{repository_namespace}{}/blobs/{digest}",
+            img_ref.repository,
+            protocol = token.protocol(),
+        );
+        let mut request = client
+            .request(Method::GET, url)
+            .header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
+        if let Some(token) = &token.auth_token {
+            request = request.bearer_auth(&token.token);
+        }
+
+        async move {
+            let layer_path = {
+                let mut p = output_dir.to_path_buf();
+                p.push(&digest);
+                p
+            };
+            let mut file = File::options()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .read(true)
+                .open(layer_path)?;
+            let response = request.send().await?;
+
+            let stream = response.bytes_stream();
+            if decompress_layers && is_media_type_gzipped(layer.media_type()) {
+                let mut decoder = flate2::write::GzDecoder::new(&mut file);
+                stream_to_output(stream, &mut decoder, prog.clone()).await?;
+                decoder.finish()?;
+            } else {
+                stream_to_output(stream, &mut file, prog.clone()).await?;
+            }
+
+            prog.finish();
+
+            Ok::<_, anyhow::Error>((digest, file))
+        }
+    });
+
+    let layers: HashMap<_, _> = futures::future::try_join_all(layer_futures)
+        .await?
+        .into_iter()
+        .collect();
+    Ok(layers)
+}
+
 fn push_file_data<W: Write>(
     builder: &mut tar::Builder<W>,
     path: &str,
@@ -221,6 +301,7 @@ fn push_file_data<W: Write>(
 
 #[derive(Clone, Debug)]
 struct ManifestBundle {
+    img_ref: ParsedImageReference,
     manifest: ImageManifest,
     raw_manifest: String,
     #[allow(unused)]
@@ -288,6 +369,7 @@ async fn get_manifest(
     })?;
 
     Ok(ManifestBundle {
+        img_ref: img_ref.clone(),
         manifest,
         raw_manifest,
         config,
@@ -331,79 +413,28 @@ async fn download_a_bunch(
     });
     let manifests = futures::future::try_join_all(manifest_requests).await?;
 
-    let multi_progress_bar = &indicatif::MultiProgress::new();
-    let progress_style = ProgressStyle::with_template(
-        "{msg}\t{percent:>3}% {bar:40.cyan/blue} {binary_bytes_per_sec}",
-    )
-    .unwrap();
-
-    // Aggregate layer digests to download.
-    eprintln!("Downloading layers");
-    let mut layer_digests = HashMap::new();
-    for (idx, (manifest_bundle, img_ref)) in manifests.iter().zip(images.iter()).enumerate() {
-        for layer in manifest_bundle.manifest.layers() {
-            let prog = multi_progress_bar.insert(
-                idx,
-                ProgressBar::new(layer.size() as u64).with_style(progress_style.clone()),
-            );
-            prog.set_message(layer.digest().clone());
-            layer_digests.insert(layer.digest().clone(), (layer.clone(), img_ref, prog));
-        }
-    }
-
-    // Create a download-future for each layer
-    let layer_futures = layer_digests
-        .into_iter()
-        .map(|(digest, (layer, img_ref, prog))| {
-            let (registry, repository_namespace) = get_registry(&img_ref.registry);
-
-            let token = registries.get(&registry).unwrap();
-            let url = format!(
-                "{protocol}://{registry}/v2/{repository_namespace}{}/blobs/{digest}",
-                img_ref.repository,
-                protocol = token.protocol(),
-            );
-            let mut request = client
-                .request(Method::GET, url)
-                .header("Accept", IMAGE_MANIFEST_CONTENT_TYPES);
-            if let Some(token) = &token.auth_token {
-                request = request.bearer_auth(&token.token);
-            }
-
-            async move {
-                let layer_path = {
-                    let mut p = output_dir.to_path_buf();
-                    p.push(&digest);
-                    p
-                };
-                let mut file = File::options()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .read(true)
-                    .open(layer_path)?;
-                let response = request.send().await?;
-
-                let stream = response.bytes_stream();
-                if decompress_layers && is_media_type_gzipped(layer.media_type()) {
-                    let mut decoder = flate2::write::GzDecoder::new(&mut file);
-                    stream_to_output(stream, &mut decoder, prog.clone()).await?;
-                    decoder.finish()?;
-                } else {
-                    stream_to_output(stream, &mut file, prog.clone()).await?;
-                }
-
-                prog.finish();
-
-                Ok::<_, anyhow::Error>((digest, file))
-            }
-        });
-
-    let mut used_layers = HashSet::new();
-    let mut layers: HashMap<_, _> = futures::future::try_join_all(layer_futures)
-        .await?
-        .into_iter()
+    // Aggregate layer digests to download - create a hashmap to deduplicate layers between images.
+    let layer_digests: HashMap<_, _> = manifests
+        .iter()
+        .flat_map(|manifest_bundle| {
+            manifest_bundle.manifest.layers().iter().map(|layer| {
+                (
+                    layer.digest().clone(),
+                    (layer.clone(), &manifest_bundle.img_ref),
+                )
+            })
+        })
         .collect();
+
+    let mut layers = download_layers(
+        &client,
+        output_dir,
+        decompress_layers,
+        layer_digests.into_values(),
+        &registries,
+    )
+    .await?;
+    let mut used_layers = HashSet::new();
 
     for (manifest_bundle, img_ref) in manifests.iter().zip(images.iter()) {
         let file_name = format!(
