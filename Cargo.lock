@@ -788,9 +788,9 @@ checksum = "e2abad23fbc42b3700f2f279844dc832adb2b2eb069b2df918f455c4e18cc646"
 
 [[package]]
 name = "libc"
-version = "0.2.139"
+version = "0.2.148"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "201de327520df007757c1f0adce6e827fe8562fbc28bfd9c15571c66ca1f5f79"
+checksum = "9cdc71e17332e86d2e1d38c1f99edcb6288ee11b815fb1a4b049eaa2114d369b"
 
 [[package]]
 name = "linux-raw-sys"
@@ -1364,7 +1364,7 @@ dependencies = [
  "tar",
  "thiserror",
  "tokio",
- "tui-tree-widget",
+ "tui-tree-widget-table",
  "url",
 ]
 
@@ -1618,10 +1618,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3528ecfd12c466c6f163363caf2d02a71161dd5e1cc6ae7b34207ea2d42d81ed"
 
 [[package]]
-name = "tui-tree-widget"
-version = "0.13.0"
+name = "tui-tree-widget-table"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f01f9172fb8f4f925fb1e259c2f411be14af031ab8b35d517fd05cb78c0784d5"
+checksum = "03a8da3231d234f83e247e41ccbb6d69c0ef25b50c4bc56ba1e217ca09bbbe75"
 dependencies = [
  "ratatui",
  "unicode-width",

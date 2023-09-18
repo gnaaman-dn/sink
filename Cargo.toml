@@ -25,7 +25,7 @@ sha2 = "0.9.9"
 tar = "0.4.38"
 thiserror = "1.0.39"
 tokio = { version = "1.26.0", features = ["full"] }
-tui-tree-widget = "0.13.0"
+tui-tree-widget-table = "0.1"
 url = "2.3.1"
 
 [profile.release]

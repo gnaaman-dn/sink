@@ -751,8 +751,24 @@ enum SubCommand {
         #[arg(long)]
         output_dir: Option<PathBuf>,
     },
+    /// Analyze an image.
+    /// If no `output` is specified, the results will be shown in a TUI, otherwise
+    /// they will be written to the specified path in JSON format.
+    ///
+    /// The file can later be passed to `show-analysis`.
+    ///
+    /// # Note #
+    /// Due to limitations of JSON, saving the report will cause non-UTF-8 file names to be
+    /// changed.
     Analyze {
         tar_file: String,
+
+        /// Save analysis results
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    ShowAnalysis {
+        analysis_file: PathBuf,
     },
 }
 
@@ -762,8 +778,11 @@ async fn main() -> anyhow::Result<()> {
 
     // analyze(&image_tar_name);
     match args.command {
-        SubCommand::Analyze { tar_file } => {
-            analyze::analyze(&tar_file);
+        SubCommand::Analyze { tar_file, output } => {
+            analyze::analyze(&tar_file, output.as_deref());
+        }
+        SubCommand::ShowAnalysis { analysis_file } => {
+            analyze::display_saved_analysis(&analysis_file);
         }
         SubCommand::Download {
             images,

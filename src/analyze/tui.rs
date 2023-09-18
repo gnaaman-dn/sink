@@ -1,4 +1,7 @@
-use std::io::{self, Stdout};
+use std::{
+    io::{self, Stdout},
+    path::Path,
+};
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -10,9 +13,75 @@ use oci_spec::image::ImageConfiguration;
 use ratatui::{prelude::*, widgets::*};
 
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
-use tui_tree_widget::{TreeItem, TreeState};
+use tui_tree_widget_table::{TreeItem, TreeState};
 
 use crate::analyze::LayerAnalysisResult;
+
+fn bytes_to_human_size(byte_size: u64) -> (f64, &'static str) {
+    if byte_size > 1024 * 1024 * 1024 {
+        (byte_size as f64 / (1024.0 * 1024.0 * 1024.0), "GiB")
+    } else if byte_size > 1024 * 1024 {
+        (byte_size as f64 / (1024.0 * 1024.0), "MiB")
+    } else if byte_size > 1024 {
+        (byte_size as f64 / (1024.0), "KiB")
+    } else {
+        (byte_size as f64, "B")
+    }
+}
+
+fn mode_to_string(mode: u32) -> String {
+    let bits = [
+        if mode & 0o400 != 0 { 'r' } else { '-' },
+        if mode & 0o200 != 0 { 'w' } else { '-' },
+        if mode & 0o100 != 0 { 'x' } else { '-' },
+        if mode & 0o040 != 0 { 'r' } else { '-' },
+        if mode & 0o020 != 0 { 'w' } else { '-' },
+        if mode & 0o010 != 0 { 'x' } else { '-' },
+        if mode & 0o004 != 0 { 'r' } else { '-' },
+        if mode & 0o002 != 0 { 'w' } else { '-' },
+        if mode & 0o001 != 0 { 'x' } else { '-' },
+    ];
+    bits.into_iter().collect()
+}
+
+impl super::DirectoryMetadata {
+    pub fn to_tui_tree_item(&self) -> Vec<tui_tree_widget_table::TreeItem> {
+        let mut children: Vec<_> = self.children.iter().collect();
+        children.sort_unstable_by_key(|(_k, v)| std::cmp::Reverse(v.size()));
+
+        children
+            .into_iter()
+            .map(|(k, v)| {
+                let k = format!("{}", Path::new(k).display());
+                let mode = mode_to_string(v.mode);
+                let (magnitude, unit) = bytes_to_human_size(v.size);
+                let magnitude = (magnitude * 100.0).round() / 100.0;
+                let row = Row::new([mode, format!("{magnitude: >7} {unit: <3}")]);
+
+                let mut style = match v.state {
+                    super::LayerFsNodeState::Created => Style::default(),
+                    super::LayerFsNodeState::Modified => Style::default().yellow(),
+                    super::LayerFsNodeState::ModeChanged => Style::default().blue(),
+                    super::LayerFsNodeState::Deleted => Style::default().red(),
+                };
+
+                let node = match &v.node_type {
+                    super::LayerFsNodeType::File => TreeItem::new_leaf_with_data(k, row),
+                    super::LayerFsNodeType::Symlink { target } => {
+                        style = style.italic();
+                        TreeItem::new_leaf_with_data(format!("{k} -> {}", target.display()), row)
+                    }
+                    super::LayerFsNodeType::Directory(metadata) => {
+                        TreeItem::new_with_data(k, metadata.to_tui_tree_item(), row)
+                    }
+                };
+
+                node.style(style)
+            })
+            .collect()
+    }
+}
+
 pub struct StatefulTree<'a> {
     pub state: TreeState,
     pub items: Vec<TreeItem<'a>>,
@@ -142,7 +211,7 @@ fn run(
 ) -> Result<()> {
     let mut layer_data: Vec<_> = layers
         .par_iter()
-        .map(|layer| StatefulTree::with_items(layer.file_system.unwrap_dir().into_tui_tree_item()))
+        .map(|layer| StatefulTree::with_items(layer.file_system.unwrap_dir().to_tui_tree_item()))
         .collect();
 
     let layer_configs: Vec<_> = image_config
@@ -155,20 +224,21 @@ fn run(
         .iter()
         .zip(layer_configs.iter())
         .map(|(layer, config)| {
-            let (magnitude, unit) = super::bytes_to_human_size(layer.file_system.size());
-            let size_line = format!("{magnitude:.0} {unit}");
+            let (magnitude, unit) = bytes_to_human_size(layer.file_system.size());
+            let size_line = format!("{magnitude:.2} {unit}");
+            let created_by = config.created_by().as_ref().unwrap();
+            let created_by = created_by
+                .strip_prefix("/bin/sh -c #(nop)")
+                .unwrap_or(created_by)
+                .trim()
+                .to_string();
             Row::new([
                 Cell::from(format!("{size_line: >10}")),
-                Cell::from(config.created_by().as_ref().unwrap().clone()),
+                Cell::from(created_by),
             ])
         })
         .collect::<Vec<_>>();
 
-    // let layer_list_items = layer_configs
-    //     .iter()
-    //     .map(|l| ListItem::new(l.created_by().as_deref().unwrap_or("<N/A>")))
-    //     .collect::<Vec<_>>();
-    // let mut layer_list_state = ListState::default().with_selected(Some(0));
     let mut layers_table_state = TableState::default().with_selected(Some(0));
     let mut input_focus = InputFocus::Layers;
 
@@ -236,13 +306,15 @@ fn run(
                 layer_details_pane_area,
             );
 
-            let items = tui_tree_widget::Tree::new(chosen_content_tree.items.clone())
+            let items = tui_tree_widget_table::Tree::new(chosen_content_tree.items.clone())
                 .block(
                     input_focus
                         .get_border(InputFocus::LayerContent)
                         .title("Layer Content"),
                 )
-                .highlight_style(highlight_style);
+                .highlight_style(highlight_style)
+                .table_header(Some(Row::new(["   Mode", "     Size"]).bold().underlined()))
+                .table_widths(&[Constraint::Length(10), Constraint::Length(11)]);
             frame.render_stateful_widget(items, right_half, &mut chosen_content_tree.state);
         })?;
 

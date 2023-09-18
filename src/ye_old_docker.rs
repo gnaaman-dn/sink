@@ -46,7 +46,7 @@ pub struct YeOldManifest {
     pub config: String,
     pub repo_tags: Option<Vec<String>>,
     pub layers: Vec<PathBuf>,
-    pub layer_sources: HashMap<String, oci_spec::image::Descriptor>,
+    pub layer_sources: Option<HashMap<String, oci_spec::image::Descriptor>>,
 }
 
 impl YeOldManifest {
@@ -63,11 +63,13 @@ impl YeOldManifest {
                 .map(|layer| layer_digest_to_blob_path(layer.digest()))
                 .map(PathBuf::from)
                 .collect(),
-            layer_sources: ye_new_manifest
-                .layers()
-                .iter()
-                .map(|layer| (layer.digest().clone(), layer.clone()))
-                .collect(),
+            layer_sources: Some(
+                ye_new_manifest
+                    .layers()
+                    .iter()
+                    .map(|layer| (layer.digest().clone(), layer.clone()))
+                    .collect(),
+            ),
         }
     }
 }
