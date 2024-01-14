@@ -263,11 +263,11 @@ fn run(
             );
             let left_half = Rect { x: 0, ..right_half };
             let layers_pane_area = Rect {
-                height: 10,
+                height: left_half.height / 4,
                 ..left_half
             };
             let layer_details_pane_area = Rect {
-                y: layers_pane_area.y + 10,
+                y: layers_pane_area.height,
                 ..layers_pane_area
             };
             last_height = right_half.height - 2;
