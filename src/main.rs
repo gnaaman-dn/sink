@@ -737,8 +737,8 @@ enum SubCommand {
     /// Create a tarball for an image, sans any layers present in another image.
     /// This can be used to deliver small "patches" containing only layers appeneded to an existing image.
     Delta {
-        image: String,
         base_image: String,
+        image: String,
 
         /// Decompress the downloaded layers if they are gzipped.
         #[arg(long)]
