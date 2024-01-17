@@ -106,7 +106,7 @@ async fn get_auth_info(
     repository_namespace: &str,
     repositories: impl Iterator<Item = &str>,
 ) -> anyhow::Result<RegistryAuthInfo> {
-    let url = dbg!(format!("https://{registry}/v2/"));
+    let url = format!("https://{registry}/v2/");
 
     let mut uses_https = true;
     let response = match client.get(url).send().await {
@@ -572,8 +572,6 @@ async fn download_a_bunch(
         std::fs::remove_file(file_path)?;
     }
 
-    println!("Basically done {:?}", start.elapsed());
-
     Ok(())
 }
 
@@ -690,8 +688,6 @@ async fn download_delta(
         };
         std::fs::remove_file(file_path)?;
     }
-
-    println!("Basically done {:?}", start.elapsed());
 
     Ok(())
 }
@@ -812,7 +808,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             f?;
-            println!("Basically done 2")
         }
         SubCommand::Delta {
             image,
@@ -838,7 +833,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             f?;
-            println!("Basically done 2")
         }
     }
 
