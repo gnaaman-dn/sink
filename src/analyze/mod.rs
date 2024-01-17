@@ -350,10 +350,10 @@ fn analyze_oci_archive(
     let mut layers = manifest
         .layers()
         .par_iter()
-        .map(|layer| {
+        .filter_map(|layer| {
             let layer_path = layer_digest_to_blob_path(layer.digest());
-            let layer_range = files.get(&layer_path).expect("Missing layer blob");
-            match layer.media_type() {
+            let layer_range = files.get(&layer_path)?;
+            let layer = match layer.media_type() {
                 MediaType::ImageLayer => {
                     analyze_tar_layer(layer.digest().clone(), &mmap[layer_range.clone()])
                 }
@@ -369,7 +369,8 @@ fn analyze_oci_archive(
                 }
                 MediaType::ImageLayerZstd => todo!(),
                 f => todo!("{f:?}"),
-            }
+            };
+            Some(layer)
         })
         .collect::<Vec<_>>();
 
