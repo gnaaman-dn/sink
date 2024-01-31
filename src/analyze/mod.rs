@@ -206,12 +206,11 @@ impl LayerFsNode {
 fn analyze_tar_layer_auto_detect_gzip(digest: String, buffer: &[u8]) -> LayerAnalysisResult {
     // It looks like both Docker and Podman work fine with layers where the mediaType is gzip,
     // but the actual layer data is a regualr tar.
-    // Podman will happily create such imaages with `podman save --uncompressed`;
+    // Podman will happily create such images with `podman save --uncompressed`;
     // I assume it's somehow significant, so we try to detect a tar file and avoid gunzipping.
-    let tar_magic_maybe = &buffer[TAR_MAGIC_SPAN.clone()];
-    assert!(tar_magic_maybe.len() == TAR_MAGIC.len());
+    let tar_magic_maybe = buffer.get(TAR_MAGIC_SPAN.clone());
 
-    if tar_magic_maybe == TAR_MAGIC {
+    if tar_magic_maybe == Some(TAR_MAGIC) {
         analyze_tar_layer(digest, buffer)
     } else {
         let reader = flate2::read::GzDecoder::new(buffer);
