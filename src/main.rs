@@ -268,6 +268,10 @@ async fn download_layers(
                 let mut decoder = flate2::write::GzDecoder::new(&mut file);
                 stream_to_output(stream, &mut decoder, prog.clone()).await?;
                 decoder.finish()?;
+            } else if decompress_layers && layer.media_type() == &MediaType::ImageLayerZstd {
+                let mut decoder = zstd::stream::write::Decoder::new(&mut file).unwrap();
+                stream_to_output(stream, &mut decoder, prog.clone()).await?;
+                decoder.flush()?;
             } else {
                 stream_to_output(stream, &mut file, prog.clone()).await?;
             }
