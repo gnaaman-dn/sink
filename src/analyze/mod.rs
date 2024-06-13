@@ -218,6 +218,17 @@ fn analyze_tar_layer_auto_detect_gzip(digest: String, buffer: &[u8]) -> LayerAna
     }
 }
 
+fn analyze_tar_layer_auto_detect_zstd(digest: String, buffer: &[u8]) -> LayerAnalysisResult {
+    let tar_magic_maybe = buffer.get(TAR_MAGIC_SPAN.clone());
+
+    if tar_magic_maybe == Some(TAR_MAGIC) {
+        analyze_tar_layer(digest, buffer)
+    } else {
+        let reader = zstd::stream::Decoder::new(buffer).unwrap();
+        analyze_tar_layer(digest, reader)
+    }
+}
+
 fn analyze_tar_layer<R: Read>(digest: String, r: R) -> LayerAnalysisResult {
     let mut layer_archive = Archive::new(r);
     let mut file_system = LayerFsNode::new_dir();
@@ -294,7 +305,6 @@ pub fn analyze(tar_path: &str, output: Option<&Path>) {
             let path = entry.path().unwrap().to_string_lossy().into_owned();
             let pos = entry.raw_file_position() as usize;
             let size = entry.size() as usize;
-            let path = path;
             (path, (pos..(pos + size)))
         })
         .collect();
@@ -366,7 +376,10 @@ fn analyze_oci_archive(
                         &mmap[layer_range.clone()],
                     )
                 }
-                MediaType::ImageLayerZstd => todo!(),
+                MediaType::ImageLayerZstd => analyze_tar_layer_auto_detect_zstd(
+                    layer.digest().clone(),
+                    &mmap[layer_range.clone()],
+                ),
                 f => todo!("{f:?}"),
             };
             Some(layer)

@@ -15,7 +15,6 @@ use std::{
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     str::FromStr,
-    time::Instant,
 };
 
 pub mod analyze;
@@ -502,7 +501,6 @@ async fn download_a_bunch(
     rename_registry: Option<&str>,
     output_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let start = Instant::now();
     let output_dir = output_dir.unwrap_or(Path::new("."));
 
     std::fs::create_dir_all(output_dir)?;
@@ -582,7 +580,6 @@ async fn download_delta(
     rename_registry: Option<&str>,
     output_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let start = Instant::now();
     let output_dir = output_dir.unwrap_or(Path::new("."));
 
     std::fs::create_dir_all(output_dir)?;
