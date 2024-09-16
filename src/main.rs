@@ -307,9 +307,49 @@ struct ManifestBundle {
     img_ref: ParsedImageReference,
     manifest: ImageManifest,
     raw_manifest: String,
+    manifest_content_type: String,
     #[allow(unused)]
     config: ImageConfiguration,
     raw_config: String,
+}
+
+async fn push_manifest(
+    client: Client,
+    img_ref: &ParsedImageReference,
+    auth_info: &RegistryAuthInfo,
+    raw_manifest: &str,
+    manifest_content_type: &str,
+) -> anyhow::Result<()> {
+    let tag = img_ref
+        .tag
+        .as_ref()
+        .map_or_else(|| "latest", |t| t.digest.as_ref().unwrap_or(&t.tag));
+
+    let url = format!(
+        "{protocol}://{registry}/v2/{repository_namespace}{}/manifests/{tag}",
+        img_ref.repository,
+        protocol = auth_info.protocol(),
+        registry = auth_info.registry,
+        repository_namespace = auth_info.repository_namespace,
+    );
+
+    let mut request = client
+        .put(url)
+        .header("Content-Type", manifest_content_type)
+        .body(raw_manifest.to_string());
+    if let Some(token) = &auth_info.auth_token {
+        request = request.bearer_auth(&token.token);
+    };
+    let resp = request.send().await?;
+
+    let response_status = resp.status();
+    let response_text = resp.text().await;
+
+    if !response_status.is_success() {
+        bail!("[{response_status}] Wew wewe wewe we can't retag: {response_text:?}");
+    }
+
+    Ok(())
 }
 
 async fn get_manifest(
@@ -347,6 +387,14 @@ async fn get_manifest(
         anyhow::bail!("Failed getting manifest (STATUS={status}): {error_text:?}");
     }
 
+    let manifest_content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
     let raw_manifest = response.text().await?;
     let manifest = serde_json::from_str::<ImageManifest>(&raw_manifest)
         .with_context(|| format!("Failed parsing image manifest for {url}: {raw_manifest}"))?;
@@ -375,6 +423,7 @@ async fn get_manifest(
         img_ref: img_ref.clone(),
         manifest,
         raw_manifest,
+        manifest_content_type,
         config,
         raw_config,
     })
@@ -693,6 +742,44 @@ async fn download_delta(
     Ok(())
 }
 
+async fn retag(
+    old_tag: ParsedImageReference,
+    new_tag: ParsedImageReference,
+    overwrite: bool,
+) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+
+    let images = [old_tag.clone(), new_tag.clone()];
+
+    let registries = get_registries_for_image_set(&client, &images).await?;
+
+    // Get manifest for each image
+    let [old_tag_request, new_tag_request] = images.map(|img_ref| {
+        let (registry, _repository_namespace) = get_registry(&img_ref.registry);
+        let token = registries.get(&registry).unwrap();
+        let client = client.clone();
+        async move { get_manifest(client.clone(), &img_ref, token).await }
+    });
+
+    let (old_manifest, new_manifest) = futures::join!(old_tag_request, new_tag_request);
+    if new_manifest.is_ok() && !overwrite {
+        bail!("New tag already exists!!!! not overwriting without --overwrite");
+    }
+    let old_manifest = old_manifest.unwrap();
+
+    let (registry, _repository_namespace) = get_registry(&new_tag.registry);
+    push_manifest(
+        client,
+        &new_tag,
+        registries.get(&registry).unwrap(),
+        &old_manifest.raw_manifest,
+        &old_manifest.manifest_content_type,
+    )
+    .await?;
+
+    Ok(())
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -747,6 +834,15 @@ enum SubCommand {
 
         #[arg(long)]
         output_dir: Option<PathBuf>,
+    },
+    /// Retag
+    Retag {
+        old_tag: String,
+        new_tag: String,
+
+        /// Overwrite target tag if it already exists.
+        #[arg(long)]
+        overwrite: bool,
     },
     /// Analyze an image.
     /// If no `output` is specified, the results will be shown in a TUI, otherwise
@@ -827,6 +923,22 @@ async fn main() -> anyhow::Result<()> {
                 output_dir.as_deref(),
             )
             .await;
+            match &f {
+                Ok(_) => {}
+                Err(e) => {
+                    dbg!(&e, e.backtrace());
+                }
+            }
+            f?;
+        }
+        SubCommand::Retag {
+            old_tag,
+            new_tag,
+            overwrite,
+        } => {
+            let old_tag = docker_registry_v2::ParsedImageReference::from_str(&old_tag)?;
+            let new_tag = docker_registry_v2::ParsedImageReference::from_str(&new_tag)?;
+            let f = retag(old_tag, new_tag, overwrite).await;
             match &f {
                 Ok(_) => {}
                 Err(e) => {
