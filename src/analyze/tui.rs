@@ -17,6 +17,21 @@ use tui_tree_widget_table::{TreeItem, TreeState};
 
 use crate::analyze::LayerAnalysisResult;
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+struct RowIdentifier(usize);
+
+#[derive(Copy, Clone, Debug, Default)]
+struct RowIdentifierAllocator(usize);
+
+impl RowIdentifierAllocator {
+    fn next(&mut self) -> RowIdentifier {
+        let id = RowIdentifier(self.0);
+        self.0 += 1;
+        id
+    }
+    
+}
+
 fn bytes_to_human_size(byte_size: u64) -> (f64, &'static str) {
     if byte_size > 1024 * 1024 * 1024 {
         (byte_size as f64 / (1024.0 * 1024.0 * 1024.0), "GiB")
@@ -45,7 +60,7 @@ fn mode_to_string(mode: u32) -> String {
 }
 
 impl super::DirectoryMetadata {
-    pub fn to_tui_tree_item(&self) -> Vec<tui_tree_widget_table::TreeItem> {
+    fn to_tui_tree_item(&self, id_allocator: &mut RowIdentifierAllocator) -> Vec<tui_tree_widget_table::TreeItem<'static, RowIdentifier>> {
         let mut children: Vec<_> = self.children.iter().collect();
         children.sort_unstable_by_key(|(_k, v)| std::cmp::Reverse(v.size()));
 
@@ -58,33 +73,37 @@ impl super::DirectoryMetadata {
                 let magnitude = (magnitude * 100.0).round() / 100.0;
                 let row = Row::new([mode, format!("{magnitude: >7} {unit: <3}")]);
 
-                let mut style = match v.state {
+                let style = match v.state {
                     super::LayerFsNodeState::Created => Style::default(),
                     super::LayerFsNodeState::Modified => Style::default().yellow(),
                     super::LayerFsNodeState::ModeChanged => Style::default().blue(),
                     super::LayerFsNodeState::Deleted => Style::default().red(),
                 };
-
+                let id = id_allocator.next();
                 let node = match &v.node_type {
-                    super::LayerFsNodeType::File => TreeItem::new_leaf_with_data(k, row),
+                    super::LayerFsNodeType::File => {
+                        let text = Text::raw(k).style(style);
+                        TreeItem::new_leaf_with_data(id, text, row)
+                    },
                     super::LayerFsNodeType::Symlink { target } => {
-                        style = style.italic();
-                        TreeItem::new_leaf_with_data(format!("{k} -> {}", target.display()), row)
+                        let text = Text::raw(format!("{k} -> {}", target.display())).style(style.italic());
+                        TreeItem::new_leaf_with_data(id, text, row)
                     }
                     super::LayerFsNodeType::Directory(metadata) => {
-                        TreeItem::new_with_data(k, metadata.to_tui_tree_item(), row)
+                        let text = Text::raw(k).style(style);
+                        TreeItem::new_with_data(id, text, metadata.to_tui_tree_item(id_allocator), row).unwrap()
                     }
                 };
 
-                node.style(style)
+                node
             })
             .collect()
     }
 }
 
 pub struct StatefulTree<'a> {
-    pub state: TreeState,
-    pub items: Vec<TreeItem<'a>>,
+    state: TreeState<RowIdentifier>,
+    items: Vec<TreeItem<'a, RowIdentifier>>,
 }
 
 impl<'a> StatefulTree<'a> {
@@ -96,7 +115,7 @@ impl<'a> StatefulTree<'a> {
         }
     }
 
-    pub fn with_items(items: Vec<TreeItem<'a>>) -> Self {
+    fn with_items(items: Vec<TreeItem<'a, RowIdentifier>>) -> Self {
         Self {
             state: TreeState::default(),
             items,
@@ -108,15 +127,15 @@ impl<'a> StatefulTree<'a> {
     }
 
     pub fn last(&mut self) {
-        self.state.select_last(&self.items);
+        self.state.select_last();
     }
 
     pub fn down(&mut self) {
-        self.state.key_down(&self.items);
+        self.state.key_down();
     }
 
     pub fn up(&mut self) {
-        self.state.key_up(&self.items);
+        self.state.key_up();
     }
 
     pub fn left(&mut self) {
@@ -169,13 +188,16 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     terminal.show_cursor().context("unable to show cursor")
 }
 
-const INACTIVE_BORDER: Block = Block::new()
-    .borders(Borders::ALL)
-    .border_style(Style::new().add_modifier(Modifier::DIM).fg(Color::Gray));
-const ACTIVE_BORDER: Block = Block::new()
-    .borders(Borders::ALL)
-    .border_type(BorderType::Thick)
-    .border_style(Style::new().add_modifier(Modifier::BOLD));
+lazy_static::lazy_static! {
+    static ref INACTIVE_BORDER: Block<'static> = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::new().add_modifier(Modifier::DIM).fg(Color::Gray));
+
+    static ref ACTIVE_BORDER: Block<'static> = Block::new()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::new().add_modifier(Modifier::BOLD));
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum InputFocus {
@@ -193,9 +215,9 @@ impl InputFocus {
 
     fn get_border(self, for_pane: InputFocus) -> Block<'static> {
         if self == for_pane {
-            ACTIVE_BORDER
+            ACTIVE_BORDER.clone()
         } else {
-            INACTIVE_BORDER
+            INACTIVE_BORDER.clone()
         }
     }
 }
@@ -211,7 +233,10 @@ fn run(
 ) -> Result<()> {
     let mut layer_data: Vec<_> = layers
         .par_iter()
-        .map(|layer| StatefulTree::with_items(layer.file_system.unwrap_dir().to_tui_tree_item()))
+        .map(|layer| {
+            let mut id_allocator = RowIdentifierAllocator::default();
+            StatefulTree::with_items(layer.file_system.unwrap_dir().to_tui_tree_item(&mut id_allocator))
+        })
         .collect();
 
     let layer_configs: Vec<_> = image_config
@@ -254,7 +279,7 @@ fn run(
         let chosen_content_tree = &mut layer_data[focused_layer];
 
         terminal.draw(|frame| {
-            let whole_screen = frame.size();
+            let whole_screen = frame.area();
             let right_half = Rect::new(
                 whole_screen.width / 2,
                 0,
@@ -273,11 +298,10 @@ fn run(
             last_height = right_half.height - 2;
 
             frame.render_stateful_widget(
-                ratatui::widgets::Table::new(layer_table_items.clone())
+                ratatui::widgets::Table::new(layer_table_items.clone(), &[Constraint::Length(10), Constraint::Percentage(100)])
                     .block(input_focus.get_border(InputFocus::Layers).title("Layers"))
-                    .widths(&[Constraint::Length(10), Constraint::Percentage(100)])
                     .column_spacing(2)
-                    .highlight_style(highlight_style)
+                    .row_highlight_style(highlight_style)
                     .header(Row::new([format!("{: >10}", "Size"), "Command".into()]).bold()),
                 layers_pane_area,
                 &mut layers_table_state,
@@ -302,11 +326,11 @@ fn run(
             frame.render_widget(
                 ratatui::widgets::Paragraph::new(details.join("\n"))
                     .wrap(Wrap::default())
-                    .block(INACTIVE_BORDER.title("Layer Details")),
+                    .block(INACTIVE_BORDER.clone().title("Layer Details")),
                 layer_details_pane_area,
             );
 
-            let items = tui_tree_widget_table::Tree::new(chosen_content_tree.items.clone())
+            let items = tui_tree_widget_table::Tree::new(&chosen_content_tree.items).unwrap()
                 .block(
                     input_focus
                         .get_border(InputFocus::LayerContent)
