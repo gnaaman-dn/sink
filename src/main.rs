@@ -872,10 +872,10 @@ async fn main() -> anyhow::Result<()> {
     // analyze(&image_tar_name);
     match args.command {
         SubCommand::Analyze { tar_file, output } => {
-            analyze::analyze(&tar_file, output.as_deref());
+            analyze::analyze(&tar_file, output.as_deref()).await;
         }
         SubCommand::ShowAnalysis { analysis_file } => {
-            analyze::display_saved_analysis(&analysis_file);
+            analyze::display_saved_analysis(&analysis_file).await;
         }
         SubCommand::Download {
             images,

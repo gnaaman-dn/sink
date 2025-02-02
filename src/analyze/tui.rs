@@ -5,10 +5,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use futures::{FutureExt, StreamExt};
 use oci_spec::image::ImageConfiguration;
 use ratatui::{prelude::*, widgets::*};
 
@@ -29,7 +30,6 @@ impl RowIdentifierAllocator {
         self.0 += 1;
         id
     }
-    
 }
 
 fn bytes_to_human_size(byte_size: u64) -> (f64, &'static str) {
@@ -60,7 +60,10 @@ fn mode_to_string(mode: u32) -> String {
 }
 
 impl super::DirectoryMetadata {
-    fn to_tui_tree_item(&self, id_allocator: &mut RowIdentifierAllocator) -> Vec<tui_tree_widget_table::TreeItem<'static, RowIdentifier>> {
+    fn to_tui_tree_item(
+        &self,
+        id_allocator: &mut RowIdentifierAllocator,
+    ) -> Vec<tui_tree_widget_table::TreeItem<'static, RowIdentifier>> {
         let mut children: Vec<_> = self.children.iter().collect();
         children.sort_unstable_by_key(|(_k, v)| std::cmp::Reverse(v.size()));
 
@@ -84,14 +87,21 @@ impl super::DirectoryMetadata {
                     super::LayerFsNodeType::File => {
                         let text = Text::raw(k).style(style);
                         TreeItem::new_leaf_with_data(id, text, row)
-                    },
+                    }
                     super::LayerFsNodeType::Symlink { target } => {
-                        let text = Text::raw(format!("{k} -> {}", target.display())).style(style.italic());
+                        let text =
+                            Text::raw(format!("{k} -> {}", target.display())).style(style.italic());
                         TreeItem::new_leaf_with_data(id, text, row)
                     }
                     super::LayerFsNodeType::Directory(metadata) => {
                         let text = Text::raw(k).style(style);
-                        TreeItem::new_with_data(id, text, metadata.to_tui_tree_item(id_allocator), row).unwrap()
+                        TreeItem::new_with_data(
+                            id,
+                            text,
+                            metadata.to_tui_tree_item(id_allocator),
+                            row,
+                        )
+                        .unwrap()
                     }
                 };
 
@@ -159,12 +169,14 @@ impl<'a> StatefulTree<'a> {
 /// restored to a sane state before exiting. This example does not do that. It also does not handle
 /// events or update the application state. It just draws a greeting and exits when the user
 /// presses 'q'.
-pub(crate) fn run_tui(
+pub(crate) async fn run_tui(
     image_config: &ImageConfiguration,
     layers: &[LayerAnalysisResult],
 ) -> Result<()> {
     let mut terminal = setup_terminal().context("setup failed")?;
-    run(&mut terminal, image_config, layers).context("app loop failed")?;
+    run(&mut terminal, image_config, layers)
+        .await
+        .context("app loop failed")?;
     restore_terminal(&mut terminal).context("restore terminal failed")?;
     Ok(())
 }
@@ -222,11 +234,80 @@ impl InputFocus {
     }
 }
 
+struct TuiState {
+    keep_running: bool,
+
+    input_focus: InputFocus,
+
+    // Layers
+    layers_table_state: TableState,
+    layers_table_row_count: usize,
+
+    // Can't remember what this means exactly, will need a bit of RE later.
+    last_height: usize,
+}
+
+fn handle_key_event(
+    key: KeyEvent,
+    tui_state: &mut TuiState,
+    chosen_content_tree: Option<&mut StatefulTree>,
+) {
+    match key.code {
+        KeyCode::Char('q') => {
+            tui_state.keep_running = false;
+            return;
+        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            tui_state.keep_running = false;
+            return;
+        }
+        KeyCode::Tab => tui_state.input_focus = tui_state.input_focus.next(),
+        _ => {}
+    }
+    if let InputFocus::Layers = tui_state.input_focus {
+        let focused_layer = tui_state.layers_table_state.selected().unwrap();
+
+        let new_selection = match key.code {
+            KeyCode::Down => focused_layer + 1,
+            KeyCode::Up => focused_layer.saturating_sub(1),
+            KeyCode::Home => 0,
+            KeyCode::End => usize::MAX,
+            _ => focused_layer,
+        };
+        let new_selection = new_selection.clamp(0, tui_state.layers_table_row_count - 1);
+        tui_state.layers_table_state.select(Some(new_selection));
+    }
+    if let InputFocus::LayerContent = tui_state.input_focus {
+        if let Some(chosen_content_tree) = chosen_content_tree {
+            match key.code {
+                KeyCode::Char('\n' | ' ') => chosen_content_tree.toggle(),
+                KeyCode::Left => chosen_content_tree.left(),
+                KeyCode::Right => chosen_content_tree.right(),
+                KeyCode::Down => chosen_content_tree.down(),
+                KeyCode::Up => chosen_content_tree.up(),
+                KeyCode::Home => chosen_content_tree.first(),
+                KeyCode::End => chosen_content_tree.last(),
+                KeyCode::PageDown => {
+                    for _ in 0..(tui_state.last_height) {
+                        chosen_content_tree.down();
+                    }
+                }
+                KeyCode::PageUp => {
+                    for _ in 0..(tui_state.last_height) {
+                        chosen_content_tree.up();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Run the application loop. This is where you would handle events and update the application
 /// state. This example exits when the user presses 'q'. Other styles of application loops are
 /// possible, for example, you could have multiple application states and switch between them based
 /// on events, or you could have a single application state and update it based on events.
-fn run(
+async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     image_config: &ImageConfiguration,
     layers: &[LayerAnalysisResult],
@@ -235,7 +316,12 @@ fn run(
         .par_iter()
         .map(|layer| {
             let mut id_allocator = RowIdentifierAllocator::default();
-            StatefulTree::with_items(layer.file_system.unwrap_dir().to_tui_tree_item(&mut id_allocator))
+            StatefulTree::with_items(
+                layer
+                    .file_system
+                    .unwrap_dir()
+                    .to_tui_tree_item(&mut id_allocator),
+            )
         })
         .collect();
 
@@ -264,18 +350,23 @@ fn run(
         })
         .collect::<Vec<_>>();
 
-    let mut layers_table_state = TableState::default().with_selected(Some(0));
-    let mut input_focus = InputFocus::Layers;
-
     let highlight_style = Style::new()
         .fg(Color::Black)
         .bg(Color::LightGreen)
         .add_modifier(Modifier::BOLD);
 
-    let mut last_height = 0;
+    let mut event_stream = EventStream::new();
+    let mut tui_state = TuiState {
+        keep_running: true,
+        input_focus: InputFocus::Layers,
 
-    loop {
-        let focused_layer = layers_table_state.selected().unwrap();
+        layers_table_state: TableState::default().with_selected(Some(0)),
+        layers_table_row_count: layer_table_items.len(),
+        last_height: 0,
+    };
+
+    while tui_state.keep_running {
+        let focused_layer = tui_state.layers_table_state.selected().unwrap();
         let chosen_content_tree = &mut layer_data[focused_layer];
 
         terminal.draw(|frame| {
@@ -295,16 +386,24 @@ fn run(
                 y: layers_pane_area.height,
                 ..layers_pane_area
             };
-            last_height = right_half.height - 2;
+            tui_state.last_height = right_half.height as usize - 2;
 
             frame.render_stateful_widget(
-                ratatui::widgets::Table::new(layer_table_items.clone(), &[Constraint::Length(10), Constraint::Percentage(100)])
-                    .block(input_focus.get_border(InputFocus::Layers).title("Layers"))
-                    .column_spacing(2)
-                    .row_highlight_style(highlight_style)
-                    .header(Row::new([format!("{: >10}", "Size"), "Command".into()]).bold()),
+                ratatui::widgets::Table::new(
+                    layer_table_items.clone(),
+                    &[Constraint::Length(10), Constraint::Percentage(100)],
+                )
+                .block(
+                    tui_state
+                        .input_focus
+                        .get_border(InputFocus::Layers)
+                        .title("Layers"),
+                )
+                .column_spacing(2)
+                .row_highlight_style(highlight_style)
+                .header(Row::new([format!("{: >10}", "Size"), "Command".into()]).bold()),
                 layers_pane_area,
-                &mut layers_table_state,
+                &mut tui_state.layers_table_state,
             );
 
             let layer_config = image_config
@@ -330,9 +429,11 @@ fn run(
                 layer_details_pane_area,
             );
 
-            let items = tui_tree_widget_table::Tree::new(&chosen_content_tree.items).unwrap()
+            let items = tui_tree_widget_table::Tree::new(&chosen_content_tree.items)
+                .unwrap()
                 .block(
-                    input_focus
+                    tui_state
+                        .input_focus
                         .get_border(InputFocus::LayerContent)
                         .title("Layer Content"),
                 )
@@ -342,48 +443,16 @@ fn run(
             frame.render_stateful_widget(items, right_half, &mut chosen_content_tree.state);
         })?;
 
-        if let Event::Key(key) = event::read()? {
-            match key.code {
-                KeyCode::Char('q') => return Ok(()),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(())
-                }
-                KeyCode::Tab => input_focus = input_focus.next(),
-                _ => {}
-            }
-            if let InputFocus::Layers = input_focus {
-                let new_selection = match key.code {
-                    KeyCode::Down => focused_layer + 1,
-                    KeyCode::Up => focused_layer.saturating_sub(1),
-                    KeyCode::Home => 0,
-                    KeyCode::End => usize::MAX,
-                    _ => focused_layer,
-                };
-                let new_selection = new_selection.clamp(0, layer_table_items.len() - 1);
-                layers_table_state.select(Some(new_selection));
-            }
-            if let InputFocus::LayerContent = input_focus {
-                match key.code {
-                    KeyCode::Char('\n' | ' ') => chosen_content_tree.toggle(),
-                    KeyCode::Left => chosen_content_tree.left(),
-                    KeyCode::Right => chosen_content_tree.right(),
-                    KeyCode::Down => chosen_content_tree.down(),
-                    KeyCode::Up => chosen_content_tree.up(),
-                    KeyCode::Home => chosen_content_tree.first(),
-                    KeyCode::End => chosen_content_tree.last(),
-                    KeyCode::PageDown => {
-                        for _ in 0..(last_height) {
-                            chosen_content_tree.down();
-                        }
-                    }
-                    KeyCode::PageUp => {
-                        for _ in 0..(last_height) {
-                            chosen_content_tree.up();
-                        }
-                    }
-                    _ => {}
+        let f = event_stream.next().fuse();
+
+        tokio::select! {
+            Some(event) = f => {
+                if let Event::Key(key) = event.unwrap() {
+                    handle_key_event(key, &mut tui_state, Some(chosen_content_tree));
                 }
             }
-        }
+        };
     }
+
+    Ok(())
 }

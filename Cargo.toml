@@ -9,7 +9,7 @@ edition = "2021"
 anyhow = { version = "1.0.69", features=["backtrace"]}
 bytes = "1.4.0"
 clap = { version = "4.1.8", features = ["derive"] }
-crossterm = "0.27.0"
+crossterm = { version = "0.28", features = ["event-stream"] }
 flate2 = "1.0.25"
 futures = "0.3.26"
 futures-core = "0.3.26"

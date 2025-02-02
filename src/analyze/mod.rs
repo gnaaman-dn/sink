@@ -289,7 +289,7 @@ fn analyze_tar_layer<R: Read>(digest: String, r: R) -> LayerAnalysisResult {
     }
 }
 
-pub fn analyze(tar_path: &str, output: Option<&Path>) {
+pub async fn analyze(tar_path: &str, output: Option<&Path>) {
     let file = File::open(tar_path).unwrap();
     let mmap = unsafe { memmap2::Mmap::map(&file) }.unwrap();
     let cursor = std::io::Cursor::new(&mmap);
@@ -324,17 +324,17 @@ pub fn analyze(tar_path: &str, output: Option<&Path>) {
         .unwrap();
         std::fs::write(output, contents).unwrap();
     } else {
-        tui::run_tui(&image_config, &layers).unwrap();
+        tui::run_tui(&image_config, &layers).await.unwrap();
     }
     dbg!(duration);
 }
 
-pub fn display_saved_analysis(path: &Path) {
+pub async fn display_saved_analysis(path: &Path) {
     let AnalysisResult {
         image_config,
         layers,
     } = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    tui::run_tui(&image_config, &layers).unwrap();
+    tui::run_tui(&image_config, &layers).await.unwrap();
 }
 
 fn analyze_oci_archive(
