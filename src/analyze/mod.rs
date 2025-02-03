@@ -4,7 +4,7 @@ use oci_spec::{
     image::{ImageConfiguration, MediaType},
     image::{ImageIndex, ImageManifest},
 };
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -31,6 +31,8 @@ pub(crate) struct AnalysisResult {
     pub layers: Vec<LayerAnalysisResult>,
 }
 
+type FileSystemSummary = HashMap<PathBuf, u32>;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct LayerAnalysisResult {
     pub digest: String,
@@ -39,7 +41,7 @@ pub(crate) struct LayerAnalysisResult {
         serialize_with = "serde_lossy::serialize_path_map",
         deserialize_with = "serde_lossy::deserialize_path_map"
     )]
-    pub file_system_summary: HashMap<PathBuf, u32>,
+    pub file_system_summary: FileSystemSummary,
 
     /// Directory paths that has the opaque `.wh..wh..opq` marker, which
     /// tells us that the entire directory path was deleted.
@@ -309,23 +311,84 @@ pub async fn analyze(tar_path: &str, output: Option<&Path>) {
         })
         .collect();
 
-    let (image_config, layers) = if files.contains_key("oci-layout") {
-        analyze_oci_archive(&files, &mmap)
+    let (image_config, layer_decsriptions) = if files.contains_key("oci-layout") {
+        get_oci_archive_description(&files, &mmap)
     } else {
-        analyze_docker_archive(&files, &mmap)
+        get_docker_archive_description(&files, &mmap)
     };
-    let duration = start_time.elapsed();
-    drop(mmap);
-    if let Some(output) = output {
-        let contents = serde_json::to_vec(&AnalysisResult {
-            image_config,
-            layers,
-        })
-        .unwrap();
-        std::fs::write(output, contents).unwrap();
-    } else {
-        tui::run_tui(&image_config, &layers).await.unwrap();
+
+    let layer_count = layer_decsriptions.len();
+
+    // For each known layer, we create a future that analyzes it, giving each
+    // a oneshot to send a summary to the next.
+    // The summary is needed for each layer to know about files existing in previous layers,
+    // so it can mark a file as "new" or "modified".
+    let (summary_tx, mut summary_rx) = tokio::sync::oneshot::channel();
+    summary_tx.send(FileSystemSummary::new()).unwrap();
+    let mut summary_channels = vec![];
+    for _ in 0..layer_count {
+        let (summary_tx, new_summary_rx) = tokio::sync::oneshot::channel();
+        summary_channels.push((summary_tx, summary_rx));
+        summary_rx = new_summary_rx;
     }
+
+    let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(layer_count * 10);
+
+    // Start TUI while we're analyzing.
+    let final_task = match output {
+        Some(output) => {
+            let output = output.to_path_buf();
+            tokio::spawn(async move {
+                let mut layers: Vec<_> = (0..layer_count).map(|_| None).collect();
+                for _ in 0..layer_count {
+                    let (index, result) = result_rx.recv().await.unwrap();
+                    layers[index] = Some(result);
+                }
+                let contents = serde_json::to_vec(&AnalysisResult {
+                    image_config,
+                    layers: layers.into_iter().map(Option::unwrap).collect(),
+                })
+                .unwrap();
+                std::fs::write(output, contents).unwrap();
+                anyhow::Result::<()>::Ok(())
+            })
+        }
+        None => {
+            tokio::spawn(async move { tui::run_tui_with_channel(&image_config, result_rx).await })
+        }
+    };
+
+    layer_decsriptions
+        .into_par_iter()
+        .zip(summary_channels.into_par_iter())
+        .enumerate()
+        .map(
+            |(index, ((digest, media_type, layer_range), (summary_tx, summary_rx)))| {
+                let analysis_start = std::time::Instant::now();
+                let mut analysis_result =
+                    analyze_single_layer(digest, media_type, &mmap, layer_range);
+                let analysis_duration = analysis_start.elapsed();
+                let mut merged_fs = summary_rx.blocking_recv().unwrap();
+
+                for (path, _mode) in analysis_result.file_system_summary.iter_mut() {
+                    if merged_fs.contains_key(path) {
+                        let file = analysis_result.file_system.goto_mut(&path);
+                        if file.state == LayerFsNodeState::Created {
+                            file.state = LayerFsNodeState::Modified;
+                        }
+                    }
+                }
+                merged_fs.extend(analysis_result.file_system_summary.drain());
+                summary_tx.send(merged_fs).unwrap();
+
+                result_tx.blocking_send((index, analysis_result)).unwrap();
+            },
+        )
+        .collect_into_vec(&mut Vec::new());
+
+    drop(mmap);
+    final_task.await.unwrap().unwrap();
+    let duration = start_time.elapsed();
     dbg!(duration);
 }
 
@@ -334,13 +397,13 @@ pub async fn display_saved_analysis(path: &Path) {
         image_config,
         layers,
     } = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    tui::run_tui(&image_config, &layers).await.unwrap();
+    tui::run_tui(&image_config, layers).await.unwrap();
 }
 
-fn analyze_oci_archive(
+fn get_oci_archive_description(
     files: &HashMap<String, Range<usize>>,
     mmap: &memmap2::Mmap,
-) -> (ImageConfiguration, Vec<LayerAnalysisResult>) {
+) -> (ImageConfiguration, Vec<(String, MediaType, Range<usize>)>) {
     let index_range = files
         .get("index.json")
         .expect("OCI images must have an `index.json` file");
@@ -356,56 +419,27 @@ fn analyze_oci_archive(
     let config_range = files.get(&config_path).expect("Missing config blob");
     let config: ImageConfiguration = serde_json::from_slice(&mmap[config_range.clone()]).unwrap();
 
-    let mut layers = manifest
+    let layers = manifest
         .layers()
         .par_iter()
         .filter_map(|layer| {
             let layer_path = layer_digest_to_blob_path(layer.digest());
             let layer_range = files.get(&layer_path)?;
-            let layer = match layer.media_type() {
-                MediaType::ImageLayer => {
-                    analyze_tar_layer(layer.digest().clone(), &mmap[layer_range.clone()])
-                }
-                MediaType::ImageLayerGzip => analyze_tar_layer_auto_detect_gzip(
-                    layer.digest().clone(),
-                    &mmap[layer_range.clone()],
-                ),
-                MediaType::Other(e) if e == "application/vnd.docker.image.rootfs.diff.tar.gzip" => {
-                    analyze_tar_layer_auto_detect_gzip(
-                        layer.digest().clone(),
-                        &mmap[layer_range.clone()],
-                    )
-                }
-                MediaType::ImageLayerZstd => analyze_tar_layer_auto_detect_zstd(
-                    layer.digest().clone(),
-                    &mmap[layer_range.clone()],
-                ),
-                f => todo!("{f:?}"),
-            };
-            Some(layer)
+            Some((
+                layer.digest().clone(),
+                layer.media_type().clone(),
+                layer_range.clone(),
+            ))
         })
         .collect::<Vec<_>>();
-
-    let mut merged_fs = layers[0].file_system_summary.clone();
-    for layer in layers[1..].iter_mut() {
-        for (path, _mode) in layer.file_system_summary.iter_mut() {
-            if merged_fs.contains_key(path) {
-                let file = layer.file_system.goto_mut(Path::new(path));
-                if file.state == LayerFsNodeState::Created {
-                    file.state = LayerFsNodeState::Modified;
-                }
-            }
-        }
-        merged_fs.extend(layer.file_system_summary.drain());
-    }
 
     (config, layers)
 }
 
-fn analyze_docker_archive(
+fn get_docker_archive_description(
     files: &HashMap<String, Range<usize>>,
     mmap: &memmap2::Mmap,
-) -> (ImageConfiguration, Vec<LayerAnalysisResult>) {
+) -> (ImageConfiguration, Vec<(String, MediaType, Range<usize>)>) {
     let index_range = files
         .get("manifest.json")
         .expect("OCI images must have an `index.json` file");
@@ -434,9 +468,36 @@ fn analyze_docker_archive(
             let layer_range = files
                 .get(&layer.to_string_lossy().to_string())
                 .expect("Missing layer descriptor");
-            analyze_tar_layer("<NOT_YET_IMPL>".to_string(), &mmap[layer_range.clone()])
+            (
+                "<NOT_YET_IMPL>".to_string(),
+                MediaType::ImageLayer,
+                layer_range.clone(),
+            )
         })
         .collect::<Vec<_>>();
 
     (config, layers)
+}
+
+fn analyze_single_layer(
+    digest: String,
+    media_type: MediaType,
+    mmap: &memmap2::Mmap,
+    layer_range: Range<usize>,
+) -> LayerAnalysisResult {
+    let layer = match media_type {
+        MediaType::ImageLayer => analyze_tar_layer(digest, &mmap[layer_range.clone()]),
+        MediaType::ImageLayerGzip => {
+            analyze_tar_layer_auto_detect_gzip(digest, &mmap[layer_range.clone()])
+        }
+        MediaType::Other(e) if e == "application/vnd.docker.image.rootfs.diff.tar.gzip" => {
+            analyze_tar_layer_auto_detect_gzip(digest, &mmap[layer_range.clone()])
+        }
+        MediaType::ImageLayerZstd => {
+            analyze_tar_layer_auto_detect_zstd(digest, &mmap[layer_range.clone()])
+        }
+        f => todo!("{f:?}"),
+    };
+
+    layer
 }

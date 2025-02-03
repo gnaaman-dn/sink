@@ -13,7 +13,7 @@ use futures::{FutureExt, StreamExt};
 use oci_spec::image::ImageConfiguration;
 use ratatui::{prelude::*, widgets::*};
 
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+use tokio::sync::mpsc::Receiver;
 use tui_tree_widget_table::{TreeItem, TreeState};
 
 use crate::analyze::LayerAnalysisResult;
@@ -161,20 +161,23 @@ impl<'a> StatefulTree<'a> {
     }
 }
 
-/// This is a bare minimum example. There are many approaches to running an application loop, so
-/// this is not meant to be prescriptive. It is only meant to demonstrate the basic setup and
-/// teardown of a terminal application.
-///
-/// A more robust application would probably want to handle errors and ensure that the terminal is
-/// restored to a sane state before exiting. This example does not do that. It also does not handle
-/// events or update the application state. It just draws a greeting and exits when the user
-/// presses 'q'.
 pub(crate) async fn run_tui(
     image_config: &ImageConfiguration,
-    layers: &[LayerAnalysisResult],
+    layers: Vec<LayerAnalysisResult>,
+) -> Result<()> {
+    let (tx, rx) = tokio::sync::mpsc::channel(layers.len());
+    for (i, layer) in layers.into_iter().enumerate() {
+        tx.send((i, layer)).await.unwrap();
+    }
+    run_tui_with_channel(image_config, rx).await
+}
+
+pub(crate) async fn run_tui_with_channel(
+    image_config: &ImageConfiguration,
+    layers_receiver: Receiver<(usize, LayerAnalysisResult)>,
 ) -> Result<()> {
     let mut terminal = setup_terminal().context("setup failed")?;
-    run(&mut terminal, image_config, layers)
+    run(&mut terminal, image_config, layers_receiver)
         .await
         .context("app loop failed")?;
     restore_terminal(&mut terminal).context("restore terminal failed")?;
@@ -303,6 +306,29 @@ fn handle_key_event(
     }
 }
 
+fn generate_layer_row(
+    config: &oci_spec::image::History,
+    layer_size_bytes: Option<u64>,
+) -> Row<'static> {
+    let layer_size = layer_size_bytes
+        .map(|s| {
+            let (magnitude, unit) = bytes_to_human_size(s);
+            format!("{magnitude:.2} {unit}")
+        })
+        .unwrap_or(String::from("<Loading>"));
+
+    let created_by = config.created_by().as_ref().unwrap();
+    let created_by = created_by
+        .strip_prefix("/bin/sh -c #(nop)")
+        .unwrap_or(created_by)
+        .trim()
+        .to_string();
+    Row::new([
+        Cell::from(format!("{layer_size: >10}")),
+        Cell::from(created_by),
+    ])
+}
+
 /// Run the application loop. This is where you would handle events and update the application
 /// state. This example exits when the user presses 'q'. Other styles of application loops are
 /// possible, for example, you could have multiple application states and switch between them based
@@ -310,44 +336,21 @@ fn handle_key_event(
 async fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     image_config: &ImageConfiguration,
-    layers: &[LayerAnalysisResult],
+    mut layers_receiver: tokio::sync::mpsc::Receiver<(usize, LayerAnalysisResult)>,
 ) -> Result<()> {
-    let mut layer_data: Vec<_> = layers
-        .par_iter()
-        .map(|layer| {
-            let mut id_allocator = RowIdentifierAllocator::default();
-            StatefulTree::with_items(
-                layer
-                    .file_system
-                    .unwrap_dir()
-                    .to_tui_tree_item(&mut id_allocator),
-            )
-        })
-        .collect();
-
     let layer_configs: Vec<_> = image_config
         .history()
         .iter()
         .filter(|f| !f.empty_layer().unwrap_or(false))
         .collect();
 
-    let layer_table_items = layers
+    let mut layers: Vec<Option<LayerAnalysisResult>> = layer_configs.iter().map(|_| None).collect();
+    let mut layers_ui_state: Vec<Option<StatefulTree>> =
+        layer_configs.iter().map(|_| None).collect();
+
+    let mut layer_table_items = layer_configs
         .iter()
-        .zip(layer_configs.iter())
-        .map(|(layer, config)| {
-            let (magnitude, unit) = bytes_to_human_size(layer.file_system.size());
-            let size_line = format!("{magnitude:.2} {unit}");
-            let created_by = config.created_by().as_ref().unwrap();
-            let created_by = created_by
-                .strip_prefix("/bin/sh -c #(nop)")
-                .unwrap_or(created_by)
-                .trim()
-                .to_string();
-            Row::new([
-                Cell::from(format!("{size_line: >10}")),
-                Cell::from(created_by),
-            ])
-        })
+        .map(|config| generate_layer_row(config, None))
         .collect::<Vec<_>>();
 
     let highlight_style = Style::new()
@@ -367,7 +370,7 @@ async fn run(
 
     while tui_state.keep_running {
         let focused_layer = tui_state.layers_table_state.selected().unwrap();
-        let chosen_content_tree = &mut layer_data[focused_layer];
+        let chosen_content_tree = &mut layers_ui_state[focused_layer];
 
         terminal.draw(|frame| {
             let whole_screen = frame.area();
@@ -413,7 +416,13 @@ async fn run(
                 .nth(focused_layer)
                 .unwrap();
 
-            let mut details = vec![format!("Digest: {}", layers[focused_layer].digest)];
+            let mut details = vec![format!(
+                "Digest: {}",
+                layers[focused_layer]
+                    .as_ref()
+                    .map(|layer| &*layer.digest)
+                    .unwrap_or("Loading")
+            )];
 
             if let Some(created_by) = layer_config.created_by() {
                 details.push(format!("Created by: {}", created_by));
@@ -429,18 +438,20 @@ async fn run(
                 layer_details_pane_area,
             );
 
-            let items = tui_tree_widget_table::Tree::new(&chosen_content_tree.items)
-                .unwrap()
-                .block(
-                    tui_state
-                        .input_focus
-                        .get_border(InputFocus::LayerContent)
-                        .title("Layer Content"),
-                )
-                .highlight_style(highlight_style)
-                .table_header(Some(Row::new(["   Mode", "     Size"]).bold().underlined()))
-                .table_widths(&[Constraint::Length(10), Constraint::Length(11)]);
-            frame.render_stateful_widget(items, right_half, &mut chosen_content_tree.state);
+            if let Some(chosen_content_tree) = chosen_content_tree {
+                let items = tui_tree_widget_table::Tree::new(&chosen_content_tree.items)
+                    .unwrap()
+                    .block(
+                        tui_state
+                            .input_focus
+                            .get_border(InputFocus::LayerContent)
+                            .title("Layer Content"),
+                    )
+                    .highlight_style(highlight_style)
+                    .table_header(Some(Row::new(["   Mode", "     Size"]).bold().underlined()))
+                    .table_widths(&[Constraint::Length(10), Constraint::Length(11)]);
+                frame.render_stateful_widget(items, right_half, &mut chosen_content_tree.state);
+            }
         })?;
 
         let f = event_stream.next().fuse();
@@ -448,8 +459,19 @@ async fn run(
         tokio::select! {
             Some(event) = f => {
                 if let Event::Key(key) = event.unwrap() {
-                    handle_key_event(key, &mut tui_state, Some(chosen_content_tree));
+                    handle_key_event(key, &mut tui_state, chosen_content_tree.into());
                 }
+            }
+
+            Some((index, layer)) = layers_receiver.recv() => {
+                let mut id_allocator = RowIdentifierAllocator::default();
+                layers_ui_state[index] = Some(StatefulTree::with_items(
+                    layer
+                        .file_system
+                        .unwrap_dir()
+                        .to_tui_tree_item(&mut id_allocator)));
+                layer_table_items[index] = generate_layer_row(layer_configs[index], Some(layer.file_system.size()));
+                layers[index] = Some(layer);
             }
         };
     }
